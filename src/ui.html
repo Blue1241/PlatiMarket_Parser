@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plati Radar — Умный парсер товаров и продавцов (Rust)</title>
+<style>
+  :root {
+    --bg: #0b1120;
+    --bg-elev: #111827;
+    --card: #172033;
+    --card-hover: #1d2840;
+    --border: #293548;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --accent-hover: #7dd3fc;
+    --green: #22c55e;
+    --green-bg: rgba(34, 197, 94, 0.14);
+    --amber: #f59e0b;
+    --amber-bg: rgba(245, 158, 11, 0.15);
+    --red: #ef4444;
+    --red-bg: rgba(239, 68, 68, 0.15);
+    --purple-bg: rgba(168, 85, 247, 0.15);
+    --purple: #c084fc;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .container { max-width: 1320px; margin: 0 auto; padding: 20px 18px 56px; }
+
+  /* Шапка */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; padding-bottom: 16px;
+    border-bottom: 1px solid var(--border); margin-bottom: 18px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: linear-gradient(135deg, #0284c7, #22c55e);
+    display: grid; place-items: center; font-weight: 900; font-size: 18px; color: #fff;
+    box-shadow: 0 6px 18px rgba(56, 189, 248, 0.25);
+  }
+  .brand h1 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+  .brand p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--card); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 999px; font-size: 12px; color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  /* Вкладки */
+  .tabs { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+  .tab-btn {
+    background: var(--card); color: var(--muted); border: 1px solid var(--border);
+    padding: 9px 16px; border-radius: 10px; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: 0.15s;
+  }
+  .tab-btn:hover { color: var(--text); border-color: #3b4d6b; }
+  .tab-btn.active {
+    background: rgba(56, 189, 248, 0.14); color: var(--accent);
+    border-color: var(--accent);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* Панели и формы */
+  .panel {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px; margin-bottom: 16px;
+  }
+  .presets { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .presets span { font-size: 12px; color: var(--muted); }
+  .chip {
+    background: var(--bg-elev); color: #cbd5e1; border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 999px; font-size: 12px; cursor: pointer; transition: 0.15s;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
+
+  .form-grid {
+    display: grid; grid-template-columns: 2fr 1.2fr 0.9fr 0.9fr 0.9fr;
+    gap: 12px; align-items: end;
+  }
+  .form-row-2 {
+    display: grid; grid-template-columns: 1fr auto;
+    gap: 12px; align-items: end; margin-top: 12px;
+  }
+  label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  input[type="text"], input[type="number"], select {
+    background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+    border-radius: 9px; padding: 9px 11px; font-size: 14px; outline: none; width: 100%;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #0ea5e9, #38bdf8); color: #062134;
+    border: none; border-radius: 9px; padding: 10px 20px; font-size: 14px;
+    font-weight: 700; cursor: pointer; transition: 0.15s; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 8px; justify-content: center;
+  }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-primary:disabled { opacity: 0.55; cursor: wait; }
+
+  .btn-secondary {
+    background: var(--bg-elev); color: #e2e8f0; border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 600;
+    cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* KPI сводка */
+  .kpi-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .kpi {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px 15px;
+  }
+  .kpi .k-label { font-size: 12px; color: var(--muted); }
+  .kpi .k-val { font-size: 22px; font-weight: 800; margin-top: 3px; }
+  .kpi .k-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  /* Панель быстрой фильтрации */
+  .filter-bar {
+    display: grid; grid-template-columns: 1.3fr 1.3fr 1fr 0.9fr auto;
+    gap: 12px; align-items: end; background: rgba(23, 32, 51, 0.7);
+    border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 14px;
+  }
+
+  /* Карточки товаров */
+  .deals-list { display: flex; flex-direction: column; gap: 10px; }
+  .deal-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 13px;
+    padding: 15px 18px; display: grid; grid-template-columns: 1fr 220px;
+    gap: 18px; align-items: center; transition: 0.14s;
+  }
+  .deal-card:hover { border-color: #3b5378; background: var(--card-hover); }
+  .deal-title {
+    font-size: 15px; font-weight: 650; color: var(--text); text-decoration: none;
+    display: inline-block; margin-bottom: 6px;
+  }
+  .deal-title:hover { color: var(--accent); }
+  .tariff-box {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--bg-elev); border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 7px; font-size: 12px; color: #cbd5e1; margin-bottom: 8px;
+  }
+  .badges { display: flex; flex-wrap: wrap; gap: 7px 12px; align-items: center; font-size: 12px; color: var(--muted); }
+  .badge { padding: 2px 8px; border-radius: 999px; font-weight: 650; font-size: 12px; }
+  .b-green { background: var(--green-bg); color: #4ade80; }
+  .b-amber { background: var(--amber-bg); color: #fbbf24; }
+  .b-red { background: var(--red-bg); color: #f87171; }
+  .b-purple { background: var(--purple-bg); color: var(--purple); }
+  .seller-btn {
+    background: none; border: none; color: #93c5fd; cursor: pointer;
+    padding: 0; font-size: 12px; font-weight: 600; text-decoration: underline dotted;
+  }
+  .seller-btn:hover { color: var(--accent-hover); }
+
+  .price-col {
+    display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
+    border-left: 1px solid var(--border); padding-left: 16px;
+  }
+  .real-price { font-size: 25px; font-weight: 850; color: var(--green); line-height: 1.1; }
+  .store-note { font-size: 12px; color: var(--muted); }
+  .card-actions { display: flex; gap: 7px; margin-top: 4px; flex-wrap: wrap; justify-content: flex-end; }
+
+  /* Модальное окно всех тарифов карточки */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(4, 8, 18, 0.76);
+    display: none; align-items: center; justify-content: center; padding: 16px; z-index: 100;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    max-width: 720px; width: 100%; max-height: 85vh; overflow-y: auto; padding: 20px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+  }
+  .modal-head { display: flex; justify-content: space-between; align-items: start; gap: 12px; margin-bottom: 14px; }
+  .modal-head h3 { margin: 0; font-size: 16px; }
+  .close-btn { background: none; border: none; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; }
+  .opt-group { margin-bottom: 14px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .opt-group-title { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 8px; text-transform: uppercase; }
+  .opt-row {
+    display: flex; justify-content: space-between; gap: 12px; padding: 7px 0;
+    border-bottom: 1px solid rgba(41, 53, 72, 0.55); font-size: 13px;
+  }
+  .opt-row:last-child { border-bottom: none; }
+  .opt-price { font-weight: 750; color: #4ade80; white-space: nowrap; }
+
+  /* Таблица продавцов */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; background: var(--bg-elev); }
+  tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+  .spinner {
+    width: 15px; height: 15px; border: 2px solid rgba(6, 33, 52, 0.3);
+    border-top-color: #062134; border-radius: 50%; animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .empty-state { text-align: center; padding: 38px 16px; color: var(--muted); font-size: 14px; }
+  .error-banner {
+    background: var(--red-bg); border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #fca5a5; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; display: none; font-size: 13px;
+  }
+
+  @media (max-width: 960px) {
+    .form-grid, .filter-bar { grid-template-columns: 1fr 1fr; }
+    .deal-card { grid-template-columns: 1fr; }
+    .price-col { border-left: none; border-top: 1px solid var(--border); padding-left: 0; padding-top: 12px; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">PR</div>
+      <div>
+        <h1>Plati Radar <span style="font-weight:400;color:var(--muted);font-size:14px;">Rust + Axum Web UI</span></h1>
+        <p>Поиск карточек с большими отзывами и проверкой реальной цены тарифа внутри селектора</p>
+      </div>
+    </div>
+    <div class="status-pill">
+      <span class="dot"></span>
+      <span id="serverStatus">Готов к работе</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="tab-deals">Поиск выгодных карточек</button>
+    <button class="tab-btn" data-tab="tab-seller">Проверка продавца</button>
+    <button class="tab-btn" data-tab="tab-discover">База продавцов</button>
+  </nav>
+
+  <div id="errorBanner" class="error-banner"></div>
+
+  <!-- ВКЛАДКА 1: ПОИСК КАРТОЧЕК ТОВАРОВ -->
+  <section id="tab-deals" class="tab-pane active">
+    <div class="panel">
+      <div class="presets">
+        <span>Быстрые пресеты:</span>
+        <button class="chip" onclick="applyPreset('ChatGPT Plus', 'plus', 100)">ChatGPT Plus</button>
+        <button class="chip" onclick="applyPreset('Claude Pro', 'pro', 30)">Claude Pro</button>
+        <button class="chip" onclick="applyPreset('Spotify Premium', '1 месяц', 80)">Spotify Premium</button>
+        <button class="chip" onclick="applyPreset('Xbox Game Pass Ultimate', '1 месяц', 100)">Xbox Game Pass</button>
+        <button class="chip" onclick="applyPreset('YouTube Premium', '1 месяц', 50)">YouTube Premium</button>
+        <button class="chip" onclick="applyPreset('Telegram Stars', '', 100)">Telegram Stars</button>
+        <button class="chip" onclick="applyPreset('Пополнение Steam', '', 200)">Пополнение Steam</button>
+      </div>
+
+      <form id="dealsForm" onsubmit="runDealsSearch(event)">
+        <div class="form-grid">
+          <label>Поисковый запрос на Plati
+            <input type="text" id="qInput" value="ChatGPT Plus" required placeholder="Например: ChatGPT Plus">
+          </label>
+          <label title="Слово в радиокнопке тарифа (чтобы не брать обманку GO)">Ключ нужного тарифа внутри карточки
+            <input type="text" id="kwInput" value="plus" placeholder="plus, 1 месяц (или пусто)">
+          </label>
+          <label>Мин. положит. отзывов
+            <input type="number" id="minRevInput" value="100" min="0" step="10">
+          </label>
+          <label>Макс. негатив (%)
+            <input type="number" id="maxNegInput" value="5" min="0" max="100" step="0.5">
+          </label>
+          <label title="У скольких топ-карточек глубоко проверить внутренние тарифы">Проверить карточек
+            <input type="number" id="inspectLimitInput" value="50" min="0" max="200" step="10">
+          </label>
+        </div>
+
+        <div class="form-row-2">
+          <label>Минус-слова (отсекают общие/оффлайн аккаунты и гайды)
+            <input type="text" id="excludeInput" value="оффлайн,offline,общий,shared,гайд,инструкция,аренда">
+          </label>
+          <button type="submit" class="btn-primary" id="searchBtn">
+            <span>Найти и проверить цены</span>
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Сводка KPI -->
+    <div class="kpi-grid" id="kpiGrid" style="display:none;">
+      <div class="kpi">
+        <div class="k-label">Проверенных карточек</div>
+        <div class="k-val" id="kpiCount">0</div>
+        <div class="k-sub" id="kpiShownSub">после всех фильтров</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">Лучшая реальная цена</div>
+        <div class="k-val" style="color:var(--green);" id="kpiMinPrice">—</div>
+        <div class="k-sub" id="kpiMinSeller">—</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">Медианная реальная цена</div>
+        <div class="k-val" id="kpiMedianPrice">—</div>
+        <div class="k-sub">норма рынка по выборке</div>
+      </div>
+      <div class="kpi">
+        <div class="k-label">Кликбейт на витрине</div>
+        <div class="k-val" style="color:#fbbf24;" id="kpiBaitShare">—</div>
+        <div class="k-sub">карточек с доплатой в опциях</div>
+      </div>
+    </div>
+
+    <!-- Мгновенная фильтрация и сортировка -->
+    <div class="filter-bar">
+      <label>Сортировка списка
+        <select id="clientSort" onchange="renderDeals()">
+          <option value="real_asc">Сначала дешёвые (Реальная цена ↑)</option>
+          <option value="smart_desc">Умный баланс (Отзывы + Низкая цена)</option>
+          <option value="reviews_desc">Больше всего отзывов ↓</option>
+          <option value="store_asc">Цена на витрине ↑</option>
+          <option value="returns_asc">Меньше всего возвратов (%) ↑</option>
+        </select>
+      </label>
+      <label>Фильтр на лету (по названию / тарифу / продавцу)
+        <input type="text" id="clientQuery" oninput="renderDeals()" placeholder="Напр.: без входа, на ваш аккаунт, код...">
+      </label>
+      <label>Отзывов не меньше: <strong id="clientRevLabel" style="color:var(--text);">100</strong>
+        <input type="range" id="clientMinRev" min="0" max="5000" step="50" value="100" oninput="renderDeals()">
+      </label>
+      <label>Макс. цена (₽)
+        <input type="number" id="clientMaxPrice" oninput="renderDeals()" placeholder="Без лимита">
+      </label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button type="button" class="btn-secondary" onclick="exportDealsCsv()">Скачать CSV</button>
+        <button type="button" class="btn-secondary" onclick="exportDealsJson()">JSON</button>
+      </div>
+    </div>
+
+    <div id="dealsContainer" class="deals-list">
+      <div class="empty-state">Загружаю стартовую подборку карточек…</div>
+    </div>
+  </section>
+
+  <!-- ВКЛАДКА 2: ПРОВЕРКА КОНКРЕТНОГО ПРОДАВЦА -->
+  <section id="tab-seller" class="tab-pane">
+    <div class="panel">
+      <form onsubmit="runSellerCheck(event)" style="display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end;">
+        <label>Ссылка на продавца Plati.Market или его числовой ID
+          <input type="text" id="sellerUrlInput" value="https://plati.market/seller/siberiaplay/1257289/" required>
+        </label>
+        <button type="submit" class="btn-primary" id="sellerBtn">Проверить витрину</button>
+      </form>
+    </div>
+    <div id="sellerResult">
+      <div class="empty-state">Вставь ссылку на продавца (или кликни на имя любого продавца в результатах поиска товаров) и нажми «Проверить витрину».</div>
+    </div>
+  </section>
+
+  <!-- ВКЛАДКА 3: СБОР БАЗЫ АКТИВНЫХ ПРОДАВЦОВ -->
+  <section id="tab-discover" class="tab-pane">
+    <div class="panel">
+      <form onsubmit="runDiscoverSellers(event)" style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end;">
+        <label>Сколько категорий из cats.xml обойти (1..389)
+          <input type="number" id="discCatsInput" value="10" min="1" max="389">
+        </label>
+        <label>У скольких продавцов догрузить полную HTML-витрину
+          <input type="number" id="discEnrichInput" value="15" min="0" max="100">
+        </label>
+        <button type="submit" class="btn-primary" id="discoverBtn">Собрать продавцов</button>
+        <button type="button" class="btn-secondary" onclick="exportSellersCsv()" style="height:39px;">Скачать CSV</button>
+      </form>
+    </div>
+    <div id="discoverResult" class="panel" style="padding:0;overflow-x:auto;">
+      <div class="empty-state">Нажми «Собрать продавцов», чтобы обойти категории Plati через официальный JSON API и собрать топ магазинов.</div>
+    </div>
+  </section>
+</div>
+
+<!-- МОДАЛЬНОЕ ОКНО ВСЕХ ОПЦИЙ КАРТОЧКИ -->
+<div class="modal-backdrop" id="optionsModal" onclick="if(event.target===this) closeModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h3 id="modalTitle">Тарифы внутри карточки</h3>
+        <div id="modalSub" style="font-size:12px;color:var(--muted);margin-top:3px;"></div>
+      </div>
+      <button class="close-btn" onclick="closeModal()">&times;</button>
+    </div>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<script>
+let CURRENT_DEALS = [];
+let DISCOVERED_SELLERS = [];
+
+// Переключение вкладок
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === tabId));
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorBanner');
+  if (!msg) { el.style.display = 'none'; return; }
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+function applyPreset(query, kw, minRev) {
+  document.getElementById('qInput').value = query;
+  document.getElementById('kwInput').value = kw;
+  document.getElementById('minRevInput').value = minRev;
+  document.getElementById('clientMinRev').value = minRev;
+  document.getElementById('clientRevLabel').textContent = minRev;
+  document.getElementById('dealsForm').requestSubmit();
+}
+
+// Загрузка предсохранённых данных при открытии страницы
+async function loadInitial() {
+  try {
+    const res = await fetch('/api/initial');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (Array.isArray(data.deals) && data.deals.length > 0) {
+      CURRENT_DEALS = data.deals;
+      document.getElementById('serverStatus').textContent = `В памяти ${CURRENT_DEALS.length} карточек`;
+      renderDeals();
+    } else {
+      document.getElementById('dealsContainer').innerHTML =
+        '<div class="empty-state">Нажми «Найти и проверить цены», чтобы загрузить свежие карточки с Plati.Market.</div>';
+    }
+  } catch (_) {
+    document.getElementById('dealsContainer').innerHTML =
+      '<div class="empty-state">Нажми «Найти и проверить цены», чтобы начать поиск.</div>';
+  }
+}
+
+async function runDealsSearch(e) {
+  e.preventDefault();
+  showError('');
+  const btn = document.getElementById('searchBtn');
+  const oldHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span><span>Парсим карточки и тарифы…</span>';
+
+  const minRev = Number(document.getElementById('minRevInput').value || 0);
+  document.getElementById('clientMinRev').value = minRev;
+  document.getElementById('clientRevLabel').textContent = minRev;
+
+  const payload = {
+    query: document.getElementById('qInput').value.trim(),
+    option_keyword: document.getElementById('kwInput').value.trim(),
+    min_reviews: minRev,
+    max_neg_percent: Number(document.getElementById('maxNegInput').value || 5),
+    inspect_limit: Number(document.getElementById('inspectLimitInput').value || 50),
+    exclude: document.getElementById('excludeInput').value.trim(),
+    pages: 2
+  };
+
+  try {
+    const res = await fetch('/api/deals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Ошибка запроса к серверу');
+
+    CURRENT_DEALS = data.deals || [];
+    document.getElementById('serverStatus').textContent =
+      `Найдено ${CURRENT_DEALS.length} шт. за ${(data.elapsed_ms / 1000).toFixed(2)} сек`;
+    renderDeals();
+  } catch (err) {
+    showError('Ошибка при поиске карточек: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = oldHtml;
+  }
+}
+
+function getFilteredDeals() {
+  const sort = document.getElementById('clientSort').value;
+  const q = document.getElementById('clientQuery').value.trim().toLowerCase();
+  const minRev = Number(document.getElementById('clientMinRev').value || 0);
+  document.getElementById('clientRevLabel').textContent = minRev;
+  const maxPVal = document.getElementById('clientMaxPrice').value.trim();
+  const maxP = maxPVal ? Number(maxPVal) : Infinity;
+
+  const list = CURRENT_DEALS.filter(d => {
+    if (d.positive_reviews < minRev) return false;
+    if (d.real_tariff_price_rub > maxP) return false;
+    if (q) {
+      const hay = `${d.title} ${d.matched_tariff} ${d.seller_name}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  list.sort((a, b) => {
+    if (sort === 'real_asc') return (a.real_tariff_price_rub - b.real_tariff_price_rub) || (b.positive_reviews - a.positive_reviews);
+    if (sort === 'store_asc') return (a.storefront_price_rub - b.storefront_price_rub) || (b.positive_reviews - a.positive_reviews);
+    if (sort === 'reviews_desc') return (b.positive_reviews - a.positive_reviews) || (a.real_tariff_price_rub - b.real_tariff_price_rub);
+    if (sort === 'returns_asc') return (a.return_percent - b.return_percent) || (a.real_tariff_price_rub - b.real_tariff_price_rub);
+    return b.smart_score - a.smart_score;
+  });
+  return list;
+}
+
+function renderDeals() {
+  const filtered = getFilteredDeals();
+  const kpiGrid = document.getElementById('kpiGrid');
+
+  if (CURRENT_DEALS.length === 0) {
+    kpiGrid.style.display = 'none';
+    document.getElementById('dealsContainer').innerHTML =
+      '<div class="empty-state">По заданным условиям карточек не нашлось. Попробуй снизить порог отзывов или изменить запрос.</div>';
+    return;
+  }
+
+  kpiGrid.style.display = 'grid';
+  document.getElementById('kpiCount').textContent = `${filtered.length} / ${CURRENT_DEALS.length}`;
+
+  if (filtered.length > 0) {
+    const prices = filtered.map(d => d.real_tariff_price_rub).sort((a, b) => a - b);
+    const cheapest = filtered.reduce((m, d) => d.real_tariff_price_rub < m.real_tariff_price_rub ? d : m, filtered[0]);
+    const mid = Math.floor(prices.length / 2);
+    const median = prices.length % 2 ? prices[mid] : Math.round((prices[mid - 1] + prices[mid]) / 2);
+    const baitCount = filtered.filter(d => d.price_bait_diff_rub >= 50).length;
+
+    document.getElementById('kpiMinPrice').textContent = `${Math.round(cheapest.real_tariff_price_rub).toLocaleString('ru-RU')} ₽`;
+    document.getElementById('kpiMinSeller').textContent = `у ${cheapest.seller_name} (+${cheapest.positive_reviews} отз.)`;
+    document.getElementById('kpiMedianPrice').textContent = `${Math.round(median).toLocaleString('ru-RU')} ₽`;
+    document.getElementById('kpiBaitShare').textContent = `${Math.round((baitCount / filtered.length) * 100)}% (${baitCount} шт.)`;
+  } else {
+    document.getElementById('kpiMinPrice').textContent = '—';
+    document.getElementById('kpiMinSeller').textContent = 'нет совпадений';
+    document.getElementById('kpiMedianPrice').textContent = '—';
+    document.getElementById('kpiBaitShare').textContent = '—';
+  }
+
+  if (filtered.length === 0) {
+    document.getElementById('dealsContainer').innerHTML =
+      '<div class="empty-state">Все карточки скрыты быстрыми фильтрами выше — ослабь ползунок отзывов или очисти поле фильтра.</div>';
+    return;
+  }
+
+  document.getElementById('dealsContainer').innerHTML = filtered.map(d => {
+    const baitBadge = d.price_bait_diff_rub >= 50
+      ? `<span class="badge b-red" title="На витрине стоит цена за младший вариант">Витрина ${Math.round(d.storefront_price_rub)} ₽ → +${Math.round(d.price_bait_diff_rub)} ₽</span>`
+      : `<span class="store-note">Цена витрины: ${Math.round(d.storefront_price_rub)} ₽</span>`;
+
+    const retClass = d.return_percent > 1.0 ? 'badge b-amber' : '';
+    const adBadge = d.ad_bid_rub > 0
+      ? `<span class="badge b-purple" title="Сколько продавец платит Plati за рекламу в поиске">Реклама: ${Math.round(d.ad_bid_rub)} ₽</span>`
+      : '';
+
+    return `<article class="deal-card">
+      <div>
+        <a class="deal-title" href="${esc(d.item_url)}" target="_blank" rel="noopener noreferrer">${esc(d.title)}</a>
+        <div>
+          <span class="tariff-box">Выбранный тариф: <strong>${esc(d.matched_tariff)}</strong></span>
+        </div>
+        <div class="badges">
+          <span class="badge b-green">+${d.positive_reviews.toLocaleString('ru-RU')} отзывов</span>
+          <span>Негатив: ${d.negative_reviews} (${d.neg_percent}%)</span>
+          <span class="${retClass}">Возвраты: ${d.returns_count} (${d.return_percent}%)</span>
+          <span>Продаж: ${d.sold_count.toLocaleString('ru-RU')}</span>
+          ${adBadge}
+          <span>Продавец: <button type="button" class="seller-btn" onclick="inspectSellerFromCard('${esc(d.seller_url)}')">${esc(d.seller_name)}</button> (рейт. ${Math.round(d.seller_rating)})</span>
+        </div>
+      </div>
+      <div class="price-col">
+        <div class="real-price">${Math.round(d.real_tariff_price_rub).toLocaleString('ru-RU')} ₽</div>
+        ${baitBadge}
+        <div class="card-actions">
+          <button type="button" class="btn-secondary" onclick="openItemOptions(${d.item_id}, '${esc(d.title.replace(/'/g, ''))}')">Все тарифы</button>
+          <a class="btn-primary" style="padding:7px 12px;font-size:12px;text-decoration:none;" href="${esc(d.item_url)}" target="_blank" rel="noopener noreferrer">На Plati ↗</a>
+        </div>
+      </div>
+    </article>`;
+  }).join('');
+}
+
+// Просмотр всех внутренних тарифов конкретной карточки в модальном окне
+async function openItemOptions(itemId, title) {
+  const modal = document.getElementById('optionsModal');
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalSub').textContent = `Карточка #${itemId} — расчёт реальных цен всех переключателей`;
+  document.getElementById('modalBody').innerHTML = '<div class="empty-state">Загружаю дерево опций из Digiseller API…</div>';
+  modal.classList.add('open');
+
+  try {
+    const res = await fetch(`/api/item-options?id=${itemId}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Не удалось получить опции');
+
+    if (!data.groups || data.groups.length === 0) {
+      document.getElementById('modalBody').innerHTML =
+        `<div class="opt-group">У этого товара нет дополнительных переключателей — действует единая цена: <strong style="color:var(--green);">${Math.round(data.base_checkout_rub)} ₽</strong>.</div>`;
+      return;
+    }
+
+    document.getElementById('modalBody').innerHTML =
+      `<div style="font-size:12px;color:var(--muted);margin-bottom:10px;">Базовая ставка карточки: <strong>${Math.round(data.base_checkout_rub)} ₽</strong></div>` +
+      data.groups.map(g => `
+        <div class="opt-group">
+          <div class="opt-group-title">${esc(g.label || 'Выбор варианта')} (${esc(g.opt_type)})</div>
+          ${g.variants.map(v => `
+            <div class="opt-row">
+              <span>${esc(v.text)} ${v.is_default ? '<span class="badge b-purple" style="margin-left:6px;">по умолч.</span>' : ''}</span>
+              <span class="opt-price">${v.modifier_rub >= 0 ? '+' : ''}${Math.round(v.modifier_rub).toLocaleString('ru-RU')} ₽ (итого ~${Math.round(data.base_checkout_rub + v.modifier_rub).toLocaleString('ru-RU')} ₽)</span>
+            </div>
+          `).join('')}
+        </div>
+      `).join('') +
+      `<div style="text-align:right;margin-top:12px;">
+        <a class="btn-primary" style="text-decoration:none;padding:8px 16px;" href="https://plati.market/itm/${itemId}" target="_blank" rel="noopener noreferrer">Перейти к покупке на Plati ↗</a>
+      </div>`;
+  } catch (err) {
+    document.getElementById('modalBody').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Ошибка: ${esc(err.message)}</div>`;
+  }
+}
+
+function closeModal() {
+  document.getElementById('optionsModal').classList.remove('open');
+}
+
+function inspectSellerFromCard(sellerUrl) {
+  switchTab('tab-seller');
+  document.getElementById('sellerUrlInput').value = sellerUrl;
+  runSellerCheck(new Event('submit'));
+}
+
+async function runSellerCheck(e) {
+  if (e && e.preventDefault) e.preventDefault();
+  showError('');
+  const raw = document.getElementById('sellerUrlInput').value.trim();
+  const url = /^\d+$/.test(raw) ? `https://plati.market/seller/s/${raw}/` : raw;
+  const btn = document.getElementById('sellerBtn');
+  btn.disabled = true;
+  document.getElementById('sellerResult').innerHTML = '<div class="empty-state">Загружаю и разбираю HTML-витрину продавца…</div>';
+
+  try {
+    const res = await fetch(`/api/seller?url=${encodeURIComponent(url)}`);
+    const s = await res.json();
+    if (!res.ok) throw new Error(s.error || 'Не удалось разобрать витрину');
+
+    const retPct = (s.sales_count && s.returns_count != null && s.sales_count > 0)
+      ? ((s.returns_count / s.sales_count) * 100).toFixed(2) + '%'
+      : '—';
+
+    document.getElementById('sellerResult').innerHTML = `
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+          <div>
+            <h2 style="margin:0;font-size:22px;">${esc(s.seller_name)} <span class="badge b-green">${esc(s.level || 'Продавец')}</span></h2>
+            <div style="font-size:13px;color:var(--muted);margin-top:4px;">ID: ${s.seller_id} • На сайте: ${esc(s.tenure || '—')}</div>
+          </div>
+          <a class="btn-primary" style="text-decoration:none;" href="${esc(s.profile_url)}" target="_blank" rel="noopener noreferrer">Открыть магазин на Plati ↗</a>
+        </div>
+        <div class="kpi-grid" style="margin-bottom:0;">
+          <div class="kpi"><div class="k-label">Рейтинг Plati</div><div class="k-val">${s.rating != null ? s.rating.toLocaleString('ru-RU') : '—'}</div></div>
+          <div class="kpi"><div class="k-label">Всего продаж</div><div class="k-val" style="color:var(--green);">${s.sales_count != null ? s.sales_count.toLocaleString('ru-RU') : '—'}</div></div>
+          <div class="kpi"><div class="k-label">Возвратов (доля)</div><div class="k-val">${s.returns_count != null ? `${s.returns_count} (${retPct})` : '—'}</div></div>
+          <div class="kpi"><div class="k-label">Отзывов / Товаров</div><div class="k-val">${s.reviews_count != null ? s.reviews_count.toLocaleString('ru-RU') : '—'} / ${s.items_count != null ? s.items_count : '—'}</div></div>
+        </div>
+      </div>`;
+  } catch (err) {
+    document.getElementById('sellerResult').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Ошибка: ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runDiscoverSellers(e) {
+  e.preventDefault();
+  showError('');
+  const btn = document.getElementById('discoverBtn');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Собираем категории…';
+  document.getElementById('discoverResult').innerHTML = '<div class="empty-state">Опрашиваю cats.xml и JSON API Plati…</div>';
+
+  try {
+    const res = await fetch('/api/discover-sellers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        max_categories: Number(document.getElementById('discCatsInput').value || 10),
+        enrich_limit: Number(document.getElementById('discEnrichInput').value || 15)
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Ошибка сбора продавцов');
+    DISCOVERED_SELLERS = data.sellers || [];
+
+    document.getElementById('discoverResult').innerHTML = `
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Магазин</th><th>Рейтинг</th><th>Уровень</th>
+            <th>Продаж</th><th>Возвратов</th><th>Товаров</th><th>На сайте</th><th>Профиль</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${DISCOVERED_SELLERS.slice(0, 200).map(s => `
+            <tr>
+              <td>${s.seller_id}</td>
+              <td><strong>${esc(s.seller_name)}</strong></td>
+              <td>${s.rating != null ? Math.round(s.rating).toLocaleString('ru-RU') : '—'}</td>
+              <td>${esc(s.level || '—')}</td>
+              <td>${s.sales_count != null ? s.sales_count.toLocaleString('ru-RU') : '—'}</td>
+              <td>${s.returns_count != null ? s.returns_count : '—'}</td>
+              <td>${s.items_count != null ? s.items_count : '—'}</td>
+              <td>${esc(s.tenure || '—')}</td>
+              <td><a href="${esc(s.profile_url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">Открыть ↗</a></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>`;
+  } catch (err) {
+    document.getElementById('discoverResult').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Ошибка: ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+// Экспорт в CSV с UTF-8 BOM для Excel
+function downloadBlob(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function toCsvRow(arr) {
+  return arr.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',');
+}
+
+function exportDealsCsv() {
+  const rows = getFilteredDeals();
+  if (!rows.length) return;
+  const header = ['item_id','title','real_tariff_price_rub','storefront_price_rub','matched_tariff','positive_reviews','negative_reviews','neg_percent','returns_count','return_percent','sold_count','seller_name','item_url'];
+  const csv = '\uFEFF' + [header.join(','), ...rows.map(r => toCsvRow(header.map(k => r[k])))].join('\r\n');
+  downloadBlob('plati_deals.csv', csv, 'text/csv;charset=utf-8');
+}
+
+function exportDealsJson() {
+  const rows = getFilteredDeals();
+  if (!rows.length) return;
+  downloadBlob('plati_deals.json', JSON.stringify(rows, null, 2), 'application/json');
+}
+
+function exportSellersCsv() {
+  if (!DISCOVERED_SELLERS.length) return;
+  const header = ['seller_id','seller_name','rating','level','sales_count','returns_count','reviews_count','items_count','tenure','profile_url'];
+  const csv = '\uFEFF' + [header.join(','), ...DISCOVERED_SELLERS.map(r => toCsvRow(header.map(k => r[k])))].join('\r\n');
+  downloadBlob('plati_sellers.csv', csv, 'text/csv;charset=utf-8');
+}
+
+loadInitial();
+</script>
+</body>
+</html>
