@@ -213,6 +213,12 @@
     background: var(--red-bg); border: 1px solid rgba(239, 68, 68, 0.4);
     color: #fca5a5; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; display: none; font-size: 13px;
   }
+  .radar-meta { display:flex; gap:10px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-top:10px; }
+  .radar-meta span { background:var(--bg-elev); border:1px solid var(--border); border-radius:999px; padding:5px 10px; }
+  .radar-table-wrap { overflow-x:auto; }
+  .delta-up { color:#4ade80; font-weight:800; }
+  .delta-down { color:#f87171; font-weight:700; }
+  .competition-low { color:#fbbf24; font-weight:700; }
 
   @media (max-width: 960px) {
     .form-grid, .filter-bar { grid-template-columns: 1fr 1fr; }
@@ -240,6 +246,7 @@
   <nav class="tabs">
     <button class="tab-btn active" data-tab="tab-deals">Поиск выгодных карточек</button>
     <button class="tab-btn" data-tab="tab-seller">Проверка продавца</button>
+    <button class="tab-btn" data-tab="tab-niches">Радар пустых ниш</button>
     <button class="tab-btn" data-tab="tab-discover">База продавцов</button>
   </nav>
 
@@ -359,7 +366,58 @@
     </div>
   </section>
 
-  <!-- ВКЛАДКА 3: СБОР БАЗЫ АКТИВНЫХ ПРОДАВЦОВ -->
+  <!-- РАДАР СПРОСА И КОНКУРЕНЦИИ -->
+  <section id="tab-niches" class="tab-pane">
+    <div class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <h2 style="margin:0 0 5px;font-size:18px;">Что покупают, где мало продавцов</h2>
+          <div style="font-size:13px;color:var(--muted);">Ежедневно ищем по названиям всех разделов cats.xml и обходим страницы результатов API; полнота зависит от выдачи поиска Plati.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button type="button" class="btn-secondary" id="radarNotifyBtn" onclick="enableRadarNotifications()">Включить уведомления</button>
+          <button type="button" class="btn-primary" id="radarRefreshBtn" onclick="refreshNicheRadar()">Снять слепок сейчас</button>
+        </div>
+      </div>
+      <div class="radar-meta" id="radarMeta"><span>Загружаю данные радара…</span></div>
+      <div style="margin-top:16px;"><div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Суммарный прирост продаж карточек, найденных в двух снимках</div><svg id="radarChart" viewBox="0 0 1000 170" preserveAspectRatio="none" style="width:100%;height:150px;background:var(--bg-elev);border-radius:10px;"></svg></div>
+    </div>
+    <div class="filter-bar" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">
+      <label>Поиск товара
+        <input type="text" id="radarSearch" placeholder="Название или продавец" oninput="renderNicheRadar()">
+      </label>
+      <label>Категория
+        <select id="radarCategory" onchange="renderNicheRadar()"><option value="">Все категории</option></select>
+      </label>
+      <label>Минимальный прирост Δ продаж
+        <input type="number" id="radarMinDelta" value="500" min="0" step="1" oninput="renderNicheRadar()">
+      </label>
+      <label>Не больше продавцов
+        <input type="number" id="radarMaxSellers" value="3" min="1" step="1" oninput="renderNicheRadar()">
+      </label>
+      <label>Макс. цена (₽)
+        <input type="number" id="radarMaxPrice" placeholder="Без лимита" min="0" step="50" oninput="renderNicheRadar()">
+      </label>
+      <label>Наценка не ниже (%)
+        <input type="number" id="radarMinMarkup" placeholder="Любая" step="5" oninput="renderNicheRadar()">
+      </label>
+      <label>Порядок
+        <select id="radarSort" onchange="renderNicheRadar()"><option value="score">Возможность</option><option value="delta">Прирост продаж</option><option value="markup">Наценка</option></select>
+      </label>
+      <label>Максимум строк
+        <select id="radarLimit" onchange="renderNicheRadar()"><option>50</option><option>100</option><option>250</option><option>500</option></select>
+      </label>
+      <div style="display:flex;gap:6px;align-items:end;flex-wrap:wrap;">
+        <button type="button" class="btn-secondary" id="watchlistOnlyBtn" onclick="toggleWatchlistOnly()">Только избранное</button>
+        <button type="button" class="btn-secondary" onclick="exportNicheRadarCsv()">Скачать CSV</button>
+      </div>
+    </div>
+    <div class="panel radar-table-wrap" id="radarResult" style="padding:0;">
+      <div class="empty-state">Ожидаю первый ежедневный слепок. Первый сбор запускается автоматически при старте сервера.</div>
+    </div>
+  </section>
+
+  <!-- ВКЛАДКА 4: СБОР БАЗЫ АКТИВНЫХ ПРОДАВЦОВ -->
   <section id="tab-discover" class="tab-pane">
     <div class="panel">
       <form onsubmit="runDiscoverSellers(event)" style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end;">
@@ -396,6 +454,11 @@
 <script>
 let CURRENT_DEALS = [];
 let DISCOVERED_SELLERS = [];
+let NICHE_TRENDS = [];
+let NICHE_META = {};
+let NICHE_HISTORY = [];
+let WATCHED_NICHES = new Set((() => { try { return JSON.parse(localStorage.getItem('plati-radar-watchlist') || '[]').map(String); } catch { return []; } })());
+let WATCHLIST_ONLY = false;
 
 // Переключение вкладок
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -684,6 +747,168 @@ async function runSellerCheck(e) {
   }
 }
 
+async function loadNicheRadar() {
+  try {
+    const res = await fetch('/api/niche-radar');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Не удалось загрузить радар');
+    NICHE_TRENDS = data.trends || [];
+    NICHE_HISTORY = data.history || [];
+    NICHE_META = data;
+    renderNicheRadar();
+    checkNicheAlerts();
+  } catch (err) {
+    document.getElementById('radarResult').innerHTML = `<div class="empty-state">Радар пока недоступен: ${esc(err.message)}. Сервер попробует собрать слепок автоматически.</div>`;
+  }
+}
+
+function drawNicheChart() {
+  const svg = document.getElementById('radarChart');
+  const points = NICHE_HISTORY.slice(-30);
+  if (!points.length) {
+    svg.innerHTML = '<text x="500" y="90" text-anchor="middle" fill="#94a3b8" font-size="14">График появится после первого сравнения снимков</text>';
+    return;
+  }
+  const max = Math.max(1, ...points.map(p => Number(p.delta_sales || 0)));
+  const xy = points.map((p, i) => {
+    const x = points.length === 1 ? 500 : 35 + i * (930 / (points.length - 1));
+    const y = 138 - (Number(p.delta_sales || 0) / max) * 112;
+    return `${x},${y}`;
+  });
+  const first = new Date(points[0].captured_at * 1000).toLocaleDateString('ru-RU');
+  const last = new Date(points[points.length - 1].captured_at * 1000).toLocaleDateString('ru-RU');
+  svg.innerHTML = `<line x1="30" y1="140" x2="970" y2="140" stroke="#293548"/><polyline points="${xy.join(' ')}" fill="none" stroke="#38bdf8" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>${xy.map(p => {const [x,y]=p.split(',');return `<circle cx="${x}" cy="${y}" r="4" fill="#4ade80"/>`;}).join('')}<text x="30" y="160" fill="#94a3b8" font-size="11">${first}</text><text x="970" y="160" text-anchor="end" fill="#94a3b8" font-size="11">${last}</text><text x="970" y="18" text-anchor="end" fill="#94a3b8" font-size="11">пик: ${max.toLocaleString('ru-RU')} продаж</text>`;
+}
+
+function renderNicheRadar() {
+  const meta = document.getElementById('radarMeta');
+  if (!meta) return;
+  const fmtTime = seconds => seconds ? new Date(seconds * 1000).toLocaleString('ru-RU') : 'ещё нет';
+  meta.innerHTML = `<span>Последний слепок: ${fmtTime(NICHE_META.captured_at)}</span>
+    <span>Сравнение: ${NICHE_META.has_comparison ? fmtTime(NICHE_META.previous_captured_at) : 'нужен снимок минимум через 20 часов'}</span>
+    <span>Категорий: ${Number(NICHE_META.categories_scanned || 0).toLocaleString('ru-RU')}</span>
+    <span>Карточек: ${Number(NICHE_META.product_count || 0).toLocaleString('ru-RU')}</span>`;
+  drawNicheChart();
+  if ('Notification' in window && Notification.permission === 'granted') {
+    document.getElementById('radarNotifyBtn').textContent = 'Уведомления включены';
+  }
+
+  const categorySelect = document.getElementById('radarCategory');
+  const selectedCategory = categorySelect.value;
+  const categories = [...new Set(NICHE_TRENDS.map(r => r.category))].sort((a,b) => a.localeCompare(b, 'ru'));
+  categorySelect.innerHTML = '<option value="">Все категории</option>' + categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  categorySelect.value = categories.includes(selectedCategory) ? selectedCategory : '';
+
+  const threshold = Number(document.getElementById('radarMinDelta').value || 0);
+  const maxSellers = Number(document.getElementById('radarMaxSellers').value || 999999);
+  const minMarkup = document.getElementById('radarMinMarkup').value === '' ? null : Number(document.getElementById('radarMinMarkup').value);
+  const maxPrice = document.getElementById('radarMaxPrice').value === '' ? null : Number(document.getElementById('radarMaxPrice').value);
+  const query = document.getElementById('radarSearch').value.trim().toLocaleLowerCase('ru');
+  const category = categorySelect.value;
+  const sort = document.getElementById('radarSort').value;
+  let rows = NICHE_TRENDS.filter(r => r.delta_sales != null && r.delta_sales >= threshold && (r.sellers_count || r.listings_count) <= maxSellers);
+  if (minMarkup != null) rows = rows.filter(r => r.markup_percent != null && r.markup_percent >= minMarkup);
+  if (maxPrice != null) rows = rows.filter(r => r.price_rub <= maxPrice);
+  if (category) rows = rows.filter(r => r.category === category);
+  if (query) rows = rows.filter(r => `${r.title} ${r.seller_name}`.toLocaleLowerCase('ru').includes(query));
+  if (WATCHLIST_ONLY) rows = rows.filter(r => WATCHED_NICHES.has(String(r.item_id)));
+  if (sort === 'delta') rows.sort((a,b) => b.delta_sales - a.delta_sales);
+  else if (sort === 'markup') rows.sort((a,b) => (b.markup_percent ?? -Infinity) - (a.markup_percent ?? -Infinity));
+  else rows.sort((a,b) => b.opportunity_score - a.opportunity_score);
+  rows = rows.slice(0, Number(document.getElementById('radarLimit').value || 50));
+
+  const root = document.getElementById('radarResult');
+  document.getElementById('watchlistOnlyBtn').textContent = WATCHLIST_ONLY ? 'Показать все' : `Только избранное (${WATCHED_NICHES.size})`;
+  if (!rows.length) {
+    root.innerHTML = `<div class="empty-state">${NICHE_META.has_comparison ? 'Ничего не найдено по выбранным фильтрам.' : 'Сначала нужен второй слепок минимум через 20 часов для расчёта Δ.'}</div>`;
+    return;
+  }
+  root.innerHTML = `<table><thead><tr><th>Сигнал</th><th>Балл</th><th>Δ продаж</th><th>Товар</th><th>Категория</th><th>Карточек</th><th>Продавцов</th><th>Цена</th><th>Наценка*</th><th>Продавец</th><th>★</th></tr></thead><tbody>
+    ${rows.map(r => {
+      const sparseDemand = r.delta_sales >= 500 && r.sellers_count <= 3;
+      const overpriced = r.markup_percent != null && r.markup_percent >= 50;
+      const signal = sparseDemand ? '🔥 Спрос + дефицит' : overpriced && r.delta_sales > 0 ? 'Рост + наценка' : r.delta_sales >= 100 ? 'Сильный спрос' : r.sellers_count <= 3 ? 'Мало продавцов' : 'Рост продаж';
+      const watched = WATCHED_NICHES.has(String(r.item_id));
+      return `<tr>
+      <td class="${sparseDemand ? 'competition-low' : ''}">${signal}</td>
+      <td><strong>${Number(r.opportunity_score || 0).toFixed(1)}</strong></td>
+      <td class="delta-up">+${Number(r.delta_sales).toLocaleString('ru-RU')}</td>
+      <td><a href="${esc(r.item_url)}" target="_blank" rel="noopener noreferrer" style="color:var(--text);font-weight:650;">${esc(r.title)}</a><div style="color:var(--muted);font-size:11px;">ID ${r.item_id} · всего продаж ${Number(r.sold_count).toLocaleString('ru-RU')}</div></td>
+      <td>${esc(r.category)}</td>
+      <td>${r.listings_count}</td>
+      <td class="${r.sellers_count <= 3 ? 'competition-low' : ''}">${r.sellers_count || '—'}</td>
+      <td>${Number(r.price_rub).toLocaleString('ru-RU')} ₽</td>
+      <td>${r.markup_percent != null ? `${r.markup_percent > 0 ? '+' : ''}${r.markup_percent}%` : 'нет аналогов'}</td>
+      <td>${esc(r.seller_name)}</td>
+      <td><button class="btn-secondary" style="padding:4px 8px;" onclick="toggleNicheWatch(${r.item_id})" aria-label="Избранное">${watched ? '★' : '☆'}</button></td>
+    </tr>`;
+    }).join('')}</tbody></table>
+    <div style="padding:9px 12px;color:var(--muted);font-size:11px;">* Сходство строится по нормализованным словам названия; служебные слова вроде «ключ», «активация», «Steam» исключены. Наценка сравнивается с медианной ценой найденных похожих карточек. Балл сочетает прирост, дефицит продавцов и относительную наценку.</div>`;
+}
+
+function toggleNicheWatch(itemId) {
+  const id = String(itemId);
+  if (WATCHED_NICHES.has(id)) WATCHED_NICHES.delete(id); else WATCHED_NICHES.add(id);
+  localStorage.setItem('plati-radar-watchlist', JSON.stringify([...WATCHED_NICHES]));
+  renderNicheRadar();
+}
+
+function toggleWatchlistOnly() {
+  WATCHLIST_ONLY = !WATCHLIST_ONLY;
+  renderNicheRadar();
+}
+
+async function enableRadarNotifications() {
+  const btn = document.getElementById('radarNotifyBtn');
+  if (!('Notification' in window)) { btn.textContent = 'Уведомления не поддерживаются'; return; }
+  const permission = await Notification.requestPermission();
+  btn.textContent = permission === 'granted' ? 'Уведомления включены' : 'Разрешение не получено';
+  checkNicheAlerts();
+}
+
+function checkNicheAlerts() {
+  if (!('Notification' in window) || Notification.permission !== 'granted' || !NICHE_META.captured_at) return;
+  if (localStorage.getItem('plati-radar-alert-snapshot') === String(NICHE_META.captured_at)) return;
+  const minDelta = Number(document.getElementById('radarMinDelta').value || 500);
+  const maxSellers = Number(document.getElementById('radarMaxSellers').value || 3);
+  const match = NICHE_TRENDS.find(r => r.delta_sales >= minDelta && r.sellers_count <= maxSellers);
+  localStorage.setItem('plati-radar-alert-snapshot', String(NICHE_META.captured_at));
+  if (match) {
+    const notification = new Notification('Plati Radar: всплеск спроса', { body: `${match.title}: +${match.delta_sales} продаж, ${match.sellers_count} продавцов` });
+    notification.onclick = () => { window.focus(); switchTab('tab-niches'); };
+  }
+}
+
+async function refreshNicheRadar() {
+  const btn = document.getElementById('radarRefreshBtn');
+  btn.disabled = true;
+  btn.textContent = 'Собираю категории…';
+  document.getElementById('radarResult').innerHTML = '<div class="empty-state">Запрашиваю numsold по категориям маркетплейса. Это может занять несколько минут…</div>';
+  try {
+    const res = await fetch('/api/niche-radar', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Ошибка обновления');
+    NICHE_TRENDS = data.trends || [];
+    NICHE_HISTORY = data.history || [];
+    NICHE_META = data;
+    renderNicheRadar();
+    checkNicheAlerts();
+  } catch (err) {
+    document.getElementById('radarResult').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Ошибка обновления: ${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Снять слепок сейчас';
+  }
+}
+
+function exportNicheRadarCsv() {
+  const rows = NICHE_TRENDS.filter(r => r.delta_sales != null);
+  if (!rows.length) return;
+  const keys = ['opportunity_score','delta_sales','title','item_id','category','listings_count','sellers_count','sold_count','previous_sold_count','price_rub','comparable_median_price_rub','markup_percent','seller_name','item_url'];
+  const csv = '\uFEFF' + [keys.join(','), ...rows.map(r => toCsvRow(keys.map(k => r[k])))].join('\r\n');
+  downloadBlob('plati_niche_radar.csv', csv, 'text/csv;charset=utf-8');
+}
+
 async function runDiscoverSellers(e) {
   e.preventDefault();
   showError('');
@@ -774,6 +999,8 @@ function exportSellersCsv() {
 }
 
 loadInitial();
+loadNicheRadar();
+setInterval(loadNicheRadar, 5 * 60 * 1000);
 </script>
 </body>
 </html>
