@@ -19,7 +19,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SELLER_URL: &str = "https://plati.market/seller/siberiaplay/1257289/";
 const CATS_SITEMAP_URL: &str = "https://plati.market/cats.xml";
@@ -321,6 +321,56 @@ fn default_cats() -> usize {
 }
 fn default_enrich() -> usize {
     15
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NicheProduct {
+    item_id: u64,
+    title: String,
+    item_url: String,
+    category: String,
+    seller_name: String,
+    seller_id: u64,
+    price_rub: f64,
+    sold_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NicheSnapshot {
+    captured_at: u64,
+    categories_scanned: usize,
+    products: Vec<NicheProduct>,
+}
+
+#[derive(Debug, Serialize)]
+struct NicheTrend {
+    #[serde(flatten)]
+    product: NicheProduct,
+    previous_sold_count: Option<u64>,
+    delta_sales: Option<i64>,
+    listings_count: usize,
+    sellers_count: usize,
+    comparable_median_price_rub: Option<f64>,
+    markup_percent: Option<f64>,
+    opportunity_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NicheHistoryPoint {
+    captured_at: u64,
+    delta_sales: u64,
+    products_tracked: usize,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn snapshot_dir(out_dir: &Path) -> PathBuf {
+    out_dir.join("niche_snapshots")
 }
 
 // ======================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
@@ -933,6 +983,281 @@ async fn fetch_category_queries(client: &Client, limit: usize) -> Result<Vec<Str
     Ok(queries)
 }
 
+async fn fetch_niche_search_page(client: &Client, category: &str, page: u32) -> Result<SearchApiResponse> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let result = async {
+            let api_url = Url::parse_with_params(
+                PUBLIC_SEARCH_API,
+                &[
+                    ("query", category),
+                    ("pagesize", "500"),
+                    ("pagenum", &page.to_string()),
+                    ("visibleOnly", "true"),
+                    ("response", "json"),
+                ],
+            )?;
+            Ok::<SearchApiResponse, anyhow::Error>(
+                client.get(api_url).send().await?.error_for_status()?.json().await?,
+            )
+        }.await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(err) => last_error = Some(err),
+        }
+        tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Не удалось загрузить страницу {} категории {}", page, category)))
+}
+
+async fn capture_niche_snapshot(client: &Client, out_dir: &Path) -> Result<NicheSnapshot> {
+    let categories = fetch_category_queries(client, 0).await?;
+    if categories.is_empty() {
+        anyhow::bail!("В cats.xml не найдено ни одной категории");
+    }
+
+    let mut category_requests = stream::iter(categories.into_iter().map(|category| {
+        let client = client.clone();
+        async move {
+            let Ok(first_page) = fetch_niche_search_page(&client, &category, 1).await else {
+                return (category, Vec::new());
+            };
+            let mut items = first_page.items.unwrap_or_default();
+            let last_page = first_page.total_pages.max(1);
+            let more_pages: Vec<Vec<SearchApiItem>> = stream::iter(2..=last_page)
+                .map(|page| {
+                    let client = client.clone();
+                    let category = category.clone();
+                    async move {
+                        fetch_niche_search_page(&client, &category, page)
+                            .await
+                            .ok()
+                            .and_then(|response| response.items)
+                            .unwrap_or_default()
+                    }
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            for page_items in more_pages {
+                items.extend(page_items);
+            }
+            (category, items)
+        }
+    }))
+    .buffer_unordered(8);
+
+    let mut products_by_id = BTreeMap::<u64, NicheProduct>::new();
+    let mut successful_categories = 0usize;
+    while let Some((category, items)) = category_requests.next().await {
+        if !items.is_empty() {
+            successful_categories += 1;
+        }
+        for item in items {
+            let (Some(item_id), Some(price)) = (item.id, item.price_rur) else { continue };
+            if price <= 0.0 {
+                continue;
+            }
+            let title = clean_space(item.name.as_deref().unwrap_or(""));
+            if title.is_empty() {
+                continue;
+            }
+            let product = NicheProduct {
+                item_id,
+                title,
+                item_url: item.url.unwrap_or_else(|| format!("https://plati.market/itm/{}", item_id)),
+                category: category.clone(),
+                seller_name: clean_space(item.seller_name.as_deref().unwrap_or("Неизвестно")),
+                seller_id: item.seller_id.unwrap_or(0),
+                price_rub: price,
+                sold_count: item.numsold.unwrap_or(0).max(0) as u64,
+            };
+            products_by_id
+                .entry(item_id)
+                .and_modify(|existing| {
+                    if product.sold_count > existing.sold_count {
+                        *existing = product.clone();
+                    }
+                })
+                .or_insert(product);
+        }
+    }
+
+    if products_by_id.is_empty() {
+        anyhow::bail!("Не удалось получить товары ни из одной категории Plati.Market");
+    }
+
+    let snapshot = NicheSnapshot {
+        captured_at: unix_now(),
+        categories_scanned: successful_categories,
+        products: products_by_id.into_values().collect(),
+    };
+    let dir = snapshot_dir(out_dir);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", snapshot.captured_at));
+    let file = File::create(path)?;
+    serde_json::to_writer_pretty(file, &snapshot)?;
+    if let Ok(snapshots) = load_recent_niche_snapshots(out_dir) {
+        if let Some(point) = build_niche_history_point(&snapshots) {
+            append_niche_history(out_dir, point)?;
+        }
+    }
+    Ok(snapshot)
+}
+
+fn load_recent_niche_snapshots(out_dir: &Path) -> Result<Vec<NicheSnapshot>> {
+    let dir = snapshot_dir(out_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+    paths.reverse();
+    let mut snapshots = Vec::new();
+    for path in paths {
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(snapshot) = serde_json::from_str::<NicheSnapshot>(&raw) {
+                snapshots.push(snapshot);
+                if previous_daily_snapshot(&snapshots).is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+fn niche_history_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("niche_history.json")
+}
+
+fn build_niche_history_point(snapshots: &[NicheSnapshot]) -> Option<NicheHistoryPoint> {
+    let current = snapshots.first()?;
+    let previous: BTreeMap<u64, u64> = previous_daily_snapshot(snapshots)?
+        .products.iter().map(|p| (p.item_id, p.sold_count)).collect();
+    let mut delta_sales = 0u64;
+    let mut products_tracked = 0usize;
+    for product in &current.products {
+        if let Some(old) = previous.get(&product.item_id) {
+            products_tracked += 1;
+            if product.sold_count > *old {
+                delta_sales = delta_sales.saturating_add(product.sold_count - old);
+            }
+        }
+    }
+    Some(NicheHistoryPoint { captured_at: current.captured_at, delta_sales, products_tracked })
+}
+
+fn read_niche_history(out_dir: &Path) -> Vec<NicheHistoryPoint> {
+    fs::read_to_string(niche_history_path(out_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn append_niche_history(out_dir: &Path, point: NicheHistoryPoint) -> Result<()> {
+    let path = niche_history_path(out_dir);
+    let mut history: Vec<NicheHistoryPoint> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    if !history.iter().any(|item| item.captured_at == point.captured_at) {
+        history.push(point);
+    }
+    history.sort_by_key(|item| item.captured_at);
+    if history.len() > 365 {
+        let remove_count = history.len() - 365;
+        history.drain(0..remove_count);
+    }
+    serde_json::to_writer_pretty(File::create(path)?, &history)?;
+    Ok(())
+}
+
+fn previous_daily_snapshot(snapshots: &[NicheSnapshot]) -> Option<&NicheSnapshot> {
+    let latest = snapshots.first()?;
+    snapshots.iter().skip(1).find(|snapshot| {
+        latest.captured_at.saturating_sub(snapshot.captured_at) >= 20 * 60 * 60
+    })
+}
+
+fn niche_title_key(title: &str) -> String {
+    const GENERIC: &[&str] = &[
+        "key", "ключ", "код", "активация", "activation", "delivery", "доставка",
+        "купить", "buy", "лицензия", "license", "steam", "global", "ru",
+    ];
+    let mut tokens: Vec<String> = title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| token.chars().count() > 1 && !GENERIC.contains(token))
+        .map(str::to_string)
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    let key = tokens.join(" ");
+    if key.is_empty() {
+        title.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+    } else {
+        key
+    }
+}
+
+fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
+    let Some(current) = snapshots.first() else { return Vec::new() };
+    let previous: BTreeMap<u64, u64> = previous_daily_snapshot(snapshots)
+        .map(|s| s.products.iter().map(|p| (p.item_id, p.sold_count)).collect())
+        .unwrap_or_default();
+    let mut title_groups = BTreeMap::<String, Vec<f64>>::new();
+    let mut title_counts = BTreeMap::<String, usize>::new();
+    let mut seller_groups = BTreeMap::<String, HashSet<u64>>::new();
+    for product in &current.products {
+        let key = niche_title_key(&product.title);
+        *title_counts.entry(key.clone()).or_default() += 1;
+        if product.seller_id > 0 {
+            seller_groups.entry(key.clone()).or_default().insert(product.seller_id);
+        }
+        title_groups.entry(key).or_default().push(product.price_rub);
+    }
+    let price_benchmarks: BTreeMap<String, Option<f64>> = title_groups.into_iter().map(|(key, mut prices)| {
+        prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if prices.len() > 1 {
+            let n = prices.len();
+            Some(if n % 2 == 0 { (prices[n / 2 - 1] + prices[n / 2]) / 2.0 } else { prices[n / 2] })
+        } else { None };
+        (key, median)
+    }).collect();
+    let mut trends: Vec<NicheTrend> = current.products.iter().map(|product| {
+        let key = niche_title_key(&product.title);
+        let median = price_benchmarks.get(&key).copied().flatten();
+        let markup = median.filter(|m| *m > 0.0).map(|m| ((product.price_rub / m - 1.0) * 100.0).round());
+        let old = previous.get(&product.item_id).copied();
+        let delta = old.map(|old| {
+            (product.sold_count as i128 - old as i128)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        });
+        let sellers_count = seller_groups.get(&key).map(|sellers| sellers.len()).unwrap_or(0);
+        let demand_score = delta.unwrap_or(0).max(0) as f64;
+        let demand_score = (demand_score.ln_1p() / 500.0_f64.ln_1p() * 45.0).clamp(0.0, 45.0);
+        let supply_score = 35.0 / (sellers_count.max(1) as f64).sqrt();
+        let markup_score = markup.unwrap_or(0.0).clamp(0.0, 200.0) * 0.1;
+        let opportunity_score = (demand_score + supply_score + markup_score).clamp(0.0, 100.0);
+        NicheTrend {
+            product: product.clone(),
+            previous_sold_count: old,
+            delta_sales: delta,
+            listings_count: *title_counts.get(&key).unwrap_or(&1),
+            sellers_count,
+            comparable_median_price_rub: median,
+            markup_percent: markup,
+            opportunity_score: (opportunity_score * 10.0).round() / 10.0,
+        }
+    }).collect();
+    trends.sort_by(|a, b| b.opportunity_score.partial_cmp(&a.opportunity_score).unwrap_or(std::cmp::Ordering::Equal));
+    trends
+}
+
 async fn discover_sellers_via_api(
     client: &Client,
     queries: &[String],
@@ -1018,6 +1343,49 @@ fn save_sellers_outputs(out_dir: &Path, records: &[SellerRecord]) -> Result<(Pat
 
 async fn index_handler() -> AxumHtml<&'static str> {
     AxumHtml(WEB_UI_HTML)
+}
+
+async fn api_niche_radar_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match load_recent_niche_snapshots(&state.out_dir) {
+        Ok(snapshots) => {
+            let mut trends = build_niche_trends(&snapshots);
+            trends.retain(|trend| trend.delta_sales.is_some());
+            trends.truncate(2_000);
+            let latest = snapshots.first();
+            let previous = previous_daily_snapshot(&snapshots);
+            (StatusCode::OK, Json(json!({
+                "trends": trends,
+                "history": read_niche_history(&state.out_dir),
+                "captured_at": latest.map(|s| s.captured_at),
+                "previous_captured_at": previous.map(|s| s.captured_at),
+                "categories_scanned": latest.map(|s| s.categories_scanned).unwrap_or(0),
+                "product_count": latest.map(|s| s.products.len()).unwrap_or(0),
+                "has_comparison": previous.is_some()
+            })))
+        }
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": err.to_string() }))),
+    }
+}
+
+async fn api_refresh_niche_radar_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match capture_niche_snapshot(&state.client, &state.out_dir).await {
+        Ok(snapshot) => {
+            let snapshots = load_recent_niche_snapshots(&state.out_dir).unwrap_or_default();
+            let mut trends = build_niche_trends(&snapshots);
+            trends.retain(|trend| trend.delta_sales.is_some());
+            trends.truncate(2_000);
+            (StatusCode::OK, Json(json!({
+                "trends": trends,
+                "history": read_niche_history(&state.out_dir),
+                "captured_at": snapshot.captured_at,
+                "previous_captured_at": previous_daily_snapshot(&snapshots).map(|s| s.captured_at),
+                "categories_scanned": snapshot.categories_scanned,
+                "product_count": snapshot.products.len(),
+                "has_comparison": previous_daily_snapshot(&snapshots).is_some()
+            })))
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": err.to_string() }))),
+    }
 }
 
 async fn api_initial_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1257,9 +1625,26 @@ async fn api_discover_sellers_handler(
 
 async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
     let state = AppState { client, out_dir };
+    let scheduler_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let needs_capture = load_recent_niche_snapshots(&scheduler_state.out_dir)
+                .ok()
+                .and_then(|s| s.first().map(|x| x.captured_at + 86_400 <= unix_now()))
+                .unwrap_or(true);
+            if needs_capture {
+                match capture_niche_snapshot(&scheduler_state.client, &scheduler_state.out_dir).await {
+                    Ok(snapshot) => println!("Слепок радара ниш сохранён: {} товаров, {} категорий", snapshot.products.len(), snapshot.categories_scanned),
+                    Err(err) => eprintln!("Не удалось обновить радар ниш: {}", err),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/initial", get(api_initial_handler))
+        .route("/api/niche-radar", get(api_niche_radar_handler).post(api_refresh_niche_radar_handler))
         .route("/api/deals", post(api_deals_handler))
         .route("/api/item-options", get(api_item_options_handler))
         .route("/api/seller", get(api_seller_handler))
