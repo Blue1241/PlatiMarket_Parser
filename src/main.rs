@@ -13,12 +13,15 @@ use reqwest::{Client, Url};
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SELLER_URL: &str = "https://plati.market/seller/siberiaplay/1257289/";
@@ -252,6 +255,7 @@ struct SellerRecord {
 struct AppState {
     client: Client,
     out_dir: PathBuf,
+    niche_running: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +346,48 @@ struct NicheSnapshot {
     products: Vec<NicheProduct>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NicheCheckpoint {
+    started_at: u64,
+    categories: Vec<String>,
+    completed_categories: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NicheProgress {
+    status: String,
+    started_at: Option<u64>,
+    updated_at: u64,
+    total_categories: usize,
+    completed_categories: usize,
+    active_categories: usize,
+    completed_pages: usize,
+    total_pages: usize,
+    products_cached: usize,
+    current_category: String,
+    resumed: bool,
+    error: Option<String>,
+}
+
+impl Default for NicheProgress {
+    fn default() -> Self {
+        Self {
+            status: "idle".to_string(),
+            started_at: None,
+            updated_at: unix_now(),
+            total_categories: 0,
+            completed_categories: 0,
+            active_categories: 0,
+            completed_pages: 0,
+            total_pages: 0,
+            products_cached: 0,
+            current_category: String::new(),
+            resumed: false,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NicheTrend {
     #[serde(flatten)]
@@ -358,6 +404,8 @@ struct NicheTrend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NicheHistoryPoint {
     captured_at: u64,
+    #[serde(default)]
+    interval_seconds: u64,
     delta_sales: u64,
     products_tracked: usize,
 }
@@ -371,6 +419,49 @@ fn unix_now() -> u64 {
 
 fn snapshot_dir(out_dir: &Path) -> PathBuf {
     out_dir.join("niche_snapshots")
+}
+
+fn niche_checkpoint_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("niche_checkpoint.json")
+}
+
+fn niche_progress_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("niche_progress.json")
+}
+
+fn niche_category_cache_path(out_dir: &Path, category_index: usize) -> PathBuf {
+    out_dir.join("niche_checkpoint_categories").join(format!("{}.json", category_index))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension("tmp");
+    serde_json::to_writer_pretty(File::create(&temp_path)?, value)?;
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+fn read_niche_progress(out_dir: &Path) -> NicheProgress {
+    fs::read_to_string(niche_progress_path(out_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+async fn update_niche_progress<F>(
+    progress: &tokio::sync::Mutex<NicheProgress>,
+    out_dir: &Path,
+    update: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut NicheProgress),
+{
+    let mut progress = progress.lock().await;
+    update(&mut progress);
+    progress.updated_at = unix_now();
+    write_json_atomic(&niche_progress_path(out_dir), &*progress)
 }
 
 // ======================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
@@ -1010,98 +1101,219 @@ async fn fetch_niche_search_page(client: &Client, category: &str, page: u32) -> 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Не удалось загрузить страницу {} категории {}", page, category)))
 }
 
+fn merge_niche_product(products: &mut BTreeMap<u64, NicheProduct>, product: NicheProduct) {
+    products.entry(product.item_id)
+        .and_modify(|existing| {
+            if product.sold_count > existing.sold_count {
+                *existing = product.clone();
+            }
+        })
+        .or_insert(product);
+}
+
 async fn capture_niche_snapshot(client: &Client, out_dir: &Path) -> Result<NicheSnapshot> {
     let categories = fetch_category_queries(client, 0).await?;
     if categories.is_empty() {
         anyhow::bail!("В cats.xml не найдено ни одной категории");
     }
 
-    let mut category_requests = stream::iter(categories.into_iter().map(|category| {
-        let client = client.clone();
-        async move {
-            let Ok(first_page) = fetch_niche_search_page(&client, &category, 1).await else {
-                return (category, Vec::new());
-            };
-            let mut items = first_page.items.unwrap_or_default();
-            let last_page = first_page.total_pages.max(1);
-            let more_pages: Vec<Vec<SearchApiItem>> = stream::iter(2..=last_page)
-                .map(|page| {
-                    let client = client.clone();
-                    let category = category.clone();
-                    async move {
-                        fetch_niche_search_page(&client, &category, page)
-                            .await
-                            .ok()
-                            .and_then(|response| response.items)
-                            .unwrap_or_default()
-                    }
-                })
-                .buffer_unordered(4)
-                .collect()
-                .await;
-            for page_items in more_pages {
-                items.extend(page_items);
+    let checkpoint_path = niche_checkpoint_path(out_dir);
+    let loaded_checkpoint = fs::read_to_string(&checkpoint_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<NicheCheckpoint>(&raw).ok())
+        .filter(|checkpoint| checkpoint.categories == categories);
+    let resumed = loaded_checkpoint.is_some();
+    let mut checkpoint = loaded_checkpoint.unwrap_or_else(|| NicheCheckpoint {
+        started_at: unix_now(),
+        categories: categories.clone(),
+        completed_categories: BTreeSet::new(),
+    });
+    let category_indexes: BTreeMap<String, usize> = categories.iter().cloned().enumerate()
+        .map(|(index, category)| (category, index)).collect();
+    let mut products_by_id = BTreeMap::<u64, NicheProduct>::new();
+    let cached_categories: Vec<String> = checkpoint.completed_categories.iter().cloned().collect();
+    for category in cached_categories {
+        let Some(index) = category_indexes.get(&category) else {
+            checkpoint.completed_categories.remove(&category);
+            continue;
+        };
+        let cache_path = niche_category_cache_path(out_dir, *index);
+        let cached: Option<Vec<NicheProduct>> = fs::read_to_string(cache_path)
+            .ok().and_then(|raw| serde_json::from_str(&raw).ok());
+        if let Some(products) = cached {
+            for product in products {
+                merge_niche_product(&mut products_by_id, product);
             }
-            (category, items)
+        } else {
+            checkpoint.completed_categories.remove(&category);
+        }
+    }
+    let progress = NicheProgress {
+        status: "collecting".to_string(),
+        started_at: Some(checkpoint.started_at),
+        updated_at: unix_now(),
+        total_categories: categories.len(),
+        completed_categories: checkpoint.completed_categories.len(),
+        active_categories: 0,
+        completed_pages: 0,
+        total_pages: 0,
+        products_cached: products_by_id.len(),
+        current_category: String::new(),
+        resumed,
+        error: None,
+    };
+    write_json_atomic(&niche_progress_path(out_dir), &progress)?;
+    write_json_atomic(&checkpoint_path, &checkpoint)?;
+
+    let progress_state = Arc::new(tokio::sync::Mutex::new(progress.clone()));
+    let pending_categories: Vec<String> = categories
+        .into_iter()
+        .filter(|category| !checkpoint.completed_categories.contains(category))
+        .collect();
+    let mut category_requests = stream::iter(pending_categories.into_iter().map(|category| {
+        let client = client.clone();
+        let progress_state = progress_state.clone();
+        let progress_dir = out_dir.to_owned();
+        async move {
+            let active_category = category.clone();
+            let _ = update_niche_progress(&progress_state, &progress_dir, |p| {
+                p.active_categories += 1;
+                p.current_category = active_category;
+            }).await;
+
+            let result: std::result::Result<Vec<SearchApiItem>, String> = async {
+                let first_page = fetch_niche_search_page(&client, &category, 1)
+                    .await.map_err(|e| e.to_string())?;
+                let mut items = first_page.items.unwrap_or_default();
+                let last_page = first_page.total_pages.max(1);
+                let _ = update_niche_progress(&progress_state, &progress_dir, |p| {
+                    p.total_pages = p.total_pages.saturating_add(last_page as usize);
+                    p.completed_pages = p.completed_pages.saturating_add(1);
+                }).await;
+                let page_results: Vec<std::result::Result<Vec<SearchApiItem>, String>> = stream::iter(2..=last_page)
+                    .map(|page| {
+                        let client = client.clone();
+                        let category = category.clone();
+                        let progress_state = progress_state.clone();
+                        let progress_dir = progress_dir.clone();
+                        async move {
+                            let result = fetch_niche_search_page(&client, &category, page)
+                                .await.map(|response| response.items.unwrap_or_default())
+                                .map_err(|e| e.to_string());
+                            let _ = update_niche_progress(&progress_state, &progress_dir, |p| {
+                                p.completed_pages = p.completed_pages.saturating_add(1);
+                            }).await;
+                            result
+                        }
+                    })
+                    .buffer_unordered(4)
+                    .collect()
+                    .await;
+                for page in page_results {
+                    items.extend(page?);
+                }
+                Ok(items)
+            }.await;
+            (category, result)
         }
     }))
     .buffer_unordered(8);
 
-    let mut products_by_id = BTreeMap::<u64, NicheProduct>::new();
-    let mut successful_categories = 0usize;
-    while let Some((category, items)) = category_requests.next().await {
-        if !items.is_empty() {
-            successful_categories += 1;
-        }
-        for item in items {
-            let (Some(item_id), Some(price)) = (item.id, item.price_rur) else { continue };
-            if price <= 0.0 {
-                continue;
-            }
-            let title = clean_space(item.name.as_deref().unwrap_or(""));
-            if title.is_empty() {
-                continue;
-            }
-            let product = NicheProduct {
-                item_id,
-                title,
-                item_url: item.url.unwrap_or_else(|| format!("https://plati.market/itm/{}", item_id)),
-                category: category.clone(),
-                seller_name: clean_space(item.seller_name.as_deref().unwrap_or("Неизвестно")),
-                seller_id: item.seller_id.unwrap_or(0),
-                price_rub: price,
-                sold_count: item.numsold.unwrap_or(0).max(0) as u64,
-            };
-            products_by_id
-                .entry(item_id)
-                .and_modify(|existing| {
-                    if product.sold_count > existing.sold_count {
-                        *existing = product.clone();
+    let mut failed_categories = Vec::new();
+    while let Some((category, result)) = category_requests.next().await {
+        match result {
+            Ok(items) => {
+                let mut category_products = Vec::new();
+                for item in items {
+                    let (Some(item_id), Some(price)) = (item.id, item.price_rur) else { continue };
+                    if price <= 0.0 {
+                        continue;
                     }
-                })
-                .or_insert(product);
+                    let title = clean_space(item.name.as_deref().unwrap_or(""));
+                    if title.is_empty() {
+                        continue;
+                    }
+                    category_products.push(NicheProduct {
+                        item_id,
+                        title,
+                        item_url: item.url.unwrap_or_else(|| format!("https://plati.market/itm/{}", item_id)),
+                        category: category.clone(),
+                        seller_name: clean_space(item.seller_name.as_deref().unwrap_or("Неизвестно")),
+                        seller_id: item.seller_id.unwrap_or(0),
+                        price_rub: price,
+                        sold_count: item.numsold.unwrap_or(0).max(0) as u64,
+                    });
+                }
+                let category_index = *category_indexes.get(&category)
+                    .ok_or_else(|| anyhow::anyhow!("Категория отсутствует в checkpoint: {}", category))?;
+                write_json_atomic(&niche_category_cache_path(out_dir, category_index), &category_products)?;
+                for product in category_products {
+                    merge_niche_product(&mut products_by_id, product);
+                }
+                checkpoint.completed_categories.insert(category.clone());
+                write_json_atomic(&checkpoint_path, &checkpoint)?;
+                let completed_categories = checkpoint.completed_categories.len();
+                let products_cached = products_by_id.len();
+                update_niche_progress(&progress_state, out_dir, |p| {
+                    p.active_categories = p.active_categories.saturating_sub(1);
+                    p.completed_categories = completed_categories;
+                    p.products_cached = products_cached;
+                    p.current_category = category;
+                }).await?;
+            }
+            Err(_error) => {
+                failed_categories.push(category.clone());
+                update_niche_progress(&progress_state, out_dir, |p| {
+                    p.active_categories = p.active_categories.saturating_sub(1);
+                    p.current_category = category;
+                }).await?;
+            }
         }
     }
 
+    if !failed_categories.is_empty() {
+        let error_message = format!(
+            "Не завершено категорий: {}. Частичный результат сохранён; повторный запуск продолжит сбор.",
+            failed_categories.len()
+        );
+        update_niche_progress(&progress_state, out_dir, move |p| {
+            p.status = "interrupted".to_string();
+            p.active_categories = 0;
+            p.error = Some(error_message);
+        }).await?;
+        anyhow::bail!("Не удалось обработать {} категорий; checkpoint сохранён для продолжения", failed_categories.len());
+    }
+
     if products_by_id.is_empty() {
+        let _ = fs::remove_file(&checkpoint_path);
+        let _ = fs::remove_dir_all(out_dir.join("niche_checkpoint_categories"));
         anyhow::bail!("Не удалось получить товары ни из одной категории Plati.Market");
     }
 
     let snapshot = NicheSnapshot {
         captured_at: unix_now(),
-        categories_scanned: successful_categories,
+        categories_scanned: checkpoint.completed_categories.len(),
         products: products_by_id.into_values().collect(),
     };
     let dir = snapshot_dir(out_dir);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", snapshot.captured_at));
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(file, &snapshot)?;
+    write_json_atomic(&path, &snapshot)?;
     if let Ok(snapshots) = load_recent_niche_snapshots(out_dir) {
         if let Some(point) = build_niche_history_point(&snapshots) {
             append_niche_history(out_dir, point)?;
         }
     }
+    let _ = fs::remove_file(checkpoint_path);
+    let _ = fs::remove_dir_all(out_dir.join("niche_checkpoint_categories"));
+    update_niche_progress(&progress_state, out_dir, |p| {
+        p.status = "completed".to_string();
+        p.active_categories = 0;
+        p.completed_categories = p.total_categories;
+        p.products_cached = snapshot.products.len();
+        p.current_category.clear();
+        p.error = None;
+    }).await?;
     Ok(snapshot)
 }
 
@@ -1136,7 +1348,8 @@ fn niche_history_path(out_dir: &Path) -> PathBuf {
 
 fn build_niche_history_point(snapshots: &[NicheSnapshot]) -> Option<NicheHistoryPoint> {
     let current = snapshots.first()?;
-    let previous: BTreeMap<u64, u64> = previous_daily_snapshot(snapshots)?
+    let previous_snapshot = snapshots.get(1)?;
+    let previous: BTreeMap<u64, u64> = previous_snapshot
         .products.iter().map(|p| (p.item_id, p.sold_count)).collect();
     let mut delta_sales = 0u64;
     let mut products_tracked = 0usize;
@@ -1148,7 +1361,12 @@ fn build_niche_history_point(snapshots: &[NicheSnapshot]) -> Option<NicheHistory
             }
         }
     }
-    Some(NicheHistoryPoint { captured_at: current.captured_at, delta_sales, products_tracked })
+    Some(NicheHistoryPoint {
+        captured_at: current.captured_at,
+        interval_seconds: current.captured_at.saturating_sub(previous_snapshot.captured_at),
+        delta_sales,
+        products_tracked,
+    })
 }
 
 fn read_niche_history(out_dir: &Path) -> Vec<NicheHistoryPoint> {
@@ -1156,6 +1374,17 @@ fn read_niche_history(out_dir: &Path) -> Vec<NicheHistoryPoint> {
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
+}
+
+fn niche_history_for_response(out_dir: &Path, snapshots: &[NicheSnapshot]) -> Vec<NicheHistoryPoint> {
+    let mut history = read_niche_history(out_dir);
+    if let Some(point) = build_niche_history_point(snapshots) {
+        if !history.iter().any(|saved| saved.captured_at == point.captured_at) {
+            history.push(point);
+        }
+    }
+    history.sort_by_key(|point| point.captured_at);
+    history
 }
 
 fn append_niche_history(out_dir: &Path, point: NicheHistoryPoint) -> Result<()> {
@@ -1355,7 +1584,9 @@ async fn api_niche_radar_handler(State(state): State<AppState>) -> impl IntoResp
             let previous = previous_daily_snapshot(&snapshots);
             (StatusCode::OK, Json(json!({
                 "trends": trends,
-                "history": read_niche_history(&state.out_dir),
+                "history": niche_history_for_response(&state.out_dir, &snapshots),
+                "progress": read_niche_progress(&state.out_dir),
+                "has_checkpoint": niche_checkpoint_path(&state.out_dir).exists(),
                 "captured_at": latest.map(|s| s.captured_at),
                 "previous_captured_at": previous.map(|s| s.captured_at),
                 "categories_scanned": latest.map(|s| s.categories_scanned).unwrap_or(0),
@@ -1367,25 +1598,63 @@ async fn api_niche_radar_handler(State(state): State<AppState>) -> impl IntoResp
     }
 }
 
-async fn api_refresh_niche_radar_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match capture_niche_snapshot(&state.client, &state.out_dir).await {
-        Ok(snapshot) => {
-            let snapshots = load_recent_niche_snapshots(&state.out_dir).unwrap_or_default();
-            let mut trends = build_niche_trends(&snapshots);
-            trends.retain(|trend| trend.delta_sales.is_some());
-            trends.truncate(2_000);
-            (StatusCode::OK, Json(json!({
-                "trends": trends,
-                "history": read_niche_history(&state.out_dir),
-                "captured_at": snapshot.captured_at,
-                "previous_captured_at": previous_daily_snapshot(&snapshots).map(|s| s.captured_at),
-                "categories_scanned": snapshot.categories_scanned,
-                "product_count": snapshot.products.len(),
-                "has_comparison": previous_daily_snapshot(&snapshots).is_some()
-            })))
-        }
-        Err(err) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": err.to_string() }))),
+fn start_niche_snapshot(state: AppState) -> bool {
+    if state.niche_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
     }
+    let mut progress = read_niche_progress(&state.out_dir);
+    progress.status = "starting".to_string();
+    progress.updated_at = unix_now();
+    progress.error = None;
+    progress.resumed = niche_checkpoint_path(&state.out_dir).exists();
+    let _ = write_json_atomic(&niche_progress_path(&state.out_dir), &progress);
+    tokio::spawn(async move {
+        match capture_niche_snapshot(&state.client, &state.out_dir).await {
+            Ok(snapshot) => println!(
+                "Слепок радара сохранён: {} карточек, {} категорий",
+                snapshot.products.len(), snapshot.categories_scanned
+            ),
+            Err(err) => {
+                eprintln!("Не удалось завершить сбор радара ниш: {}", err);
+                let mut progress = read_niche_progress(&state.out_dir);
+                progress.status = if niche_checkpoint_path(&state.out_dir).exists() {
+                    "interrupted".to_string()
+                } else {
+                    "error".to_string()
+                };
+                progress.active_categories = 0;
+                progress.error = Some(err.to_string());
+                progress.updated_at = unix_now();
+                let _ = write_json_atomic(&niche_progress_path(&state.out_dir), &progress);
+            }
+        }
+        state.niche_running.store(false, Ordering::Release);
+    });
+    true
+}
+
+async fn api_niche_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "progress": read_niche_progress(&state.out_dir),
+            "has_checkpoint": niche_checkpoint_path(&state.out_dir).exists(),
+            "running": state.niche_running.load(Ordering::Acquire)
+        })),
+    )
+}
+
+async fn api_refresh_niche_radar_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let started = start_niche_snapshot(state.clone());
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "started": started,
+            "message": if started { "Сбор запущен" } else { "Сбор уже выполняется" },
+            "progress": read_niche_progress(&state.out_dir),
+            "has_checkpoint": niche_checkpoint_path(&state.out_dir).exists()
+        })),
+    )
 }
 
 async fn api_initial_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1624,19 +1893,39 @@ async fn api_discover_sellers_handler(
 }
 
 async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
-    let state = AppState { client, out_dir };
+    if !niche_checkpoint_path(&out_dir).exists() {
+        let mut progress = read_niche_progress(&out_dir);
+        if progress.status == "starting" || progress.status == "collecting" {
+            let latest_capture = load_recent_niche_snapshots(&out_dir)
+                .ok()
+                .and_then(|snapshots| snapshots.first().map(|snapshot| snapshot.captured_at));
+            if latest_capture.map(|captured| captured >= progress.started_at.unwrap_or(u64::MAX)).unwrap_or(false) {
+                progress.status = "completed".to_string();
+                progress.error = None;
+            } else {
+                progress.status = "interrupted".to_string();
+                progress.error = Some("Процесс завершился до сохранения checkpoint; предыдущий снимок сохранён. Можно запустить новый сбор.".to_string());
+            }
+            progress.active_categories = 0;
+            progress.updated_at = unix_now();
+            write_json_atomic(&niche_progress_path(&out_dir), &progress)?;
+        }
+    }
+    let state = AppState {
+        client,
+        out_dir,
+        niche_running: Arc::new(AtomicBool::new(false)),
+    };
     let scheduler_state = state.clone();
     tokio::spawn(async move {
         loop {
-            let needs_capture = load_recent_niche_snapshots(&scheduler_state.out_dir)
+            let has_checkpoint = niche_checkpoint_path(&scheduler_state.out_dir).exists();
+            let needs_capture = has_checkpoint || load_recent_niche_snapshots(&scheduler_state.out_dir)
                 .ok()
-                .and_then(|s| s.first().map(|x| x.captured_at + 86_400 <= unix_now()))
+                .and_then(|s| s.first().map(|x| x.captured_at.saturating_add(86_400) <= unix_now()))
                 .unwrap_or(true);
             if needs_capture {
-                match capture_niche_snapshot(&scheduler_state.client, &scheduler_state.out_dir).await {
-                    Ok(snapshot) => println!("Слепок радара ниш сохранён: {} товаров, {} категорий", snapshot.products.len(), snapshot.categories_scanned),
-                    Err(err) => eprintln!("Не удалось обновить радар ниш: {}", err),
-                }
+                start_niche_snapshot(scheduler_state.clone());
             }
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
@@ -1645,6 +1934,7 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
         .route("/", get(index_handler))
         .route("/api/initial", get(api_initial_handler))
         .route("/api/niche-radar", get(api_niche_radar_handler).post(api_refresh_niche_radar_handler))
+        .route("/api/niche-radar/status", get(api_niche_status_handler))
         .route("/api/deals", post(api_deals_handler))
         .route("/api/item-options", get(api_item_options_handler))
         .route("/api/seller", get(api_seller_handler))

@@ -219,6 +219,9 @@
   .delta-up { color:#4ade80; font-weight:800; }
   .delta-down { color:#f87171; font-weight:700; }
   .competition-low { color:#fbbf24; font-weight:700; }
+  .radar-progress-box { margin-top:14px; padding:12px; background:var(--bg-elev); border:1px solid var(--border); border-radius:10px; }
+  .radar-progress-track { height:9px; margin-top:9px; overflow:hidden; background:#293548; border-radius:999px; }
+  .radar-progress-bar { height:100%; width:0; background:linear-gradient(90deg,#0ea5e9,#22c55e); transition:width .25s ease; border-radius:999px; }
 
   @media (max-width: 960px) {
     .form-grid, .filter-bar { grid-template-columns: 1fr 1fr; }
@@ -380,7 +383,15 @@
         </div>
       </div>
       <div class="radar-meta" id="radarMeta"><span>Загружаю данные радара…</span></div>
-      <div style="margin-top:16px;"><div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Суммарный прирост продаж карточек, найденных в двух снимках</div><svg id="radarChart" viewBox="0 0 1000 170" preserveAspectRatio="none" style="width:100%;height:150px;background:var(--bg-elev);border-radius:10px;"></svg></div>
+      <div id="radarProgressBox" class="radar-progress-box" style="display:none;">
+        <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;">
+          <strong id="radarProgressText">Подготовка сбора…</strong>
+          <span id="radarProgressDetail" style="color:var(--muted);"></span>
+        </div>
+        <div class="radar-progress-track"><div id="radarProgressBar" class="radar-progress-bar"></div></div>
+        <div id="radarProgressNote" style="font-size:11px;color:var(--muted);margin-top:5px;"></div>
+      </div>
+      <div style="margin-top:16px;"><div style="font-size:12px;color:var(--muted);margin-bottom:4px;">Суммарный прирост между снимками (всплывающая подсказка показывает длительность интервала)</div><svg id="radarChart" viewBox="0 0 1000 170" preserveAspectRatio="none" style="width:100%;height:150px;background:var(--bg-elev);border-radius:10px;"></svg></div>
     </div>
     <div class="filter-bar" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));">
       <label>Поиск товара
@@ -459,6 +470,8 @@ let NICHE_META = {};
 let NICHE_HISTORY = [];
 let WATCHED_NICHES = new Set((() => { try { return JSON.parse(localStorage.getItem('plati-radar-watchlist') || '[]').map(String); } catch { return []; } })());
 let WATCHLIST_ONLY = false;
+let NICHE_PROGRESS = {};
+let RADAR_POLL_TIMER = null;
 
 // Переключение вкладок
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -747,7 +760,92 @@ async function runSellerCheck(e) {
   }
 }
 
-async function loadNicheRadar() {
+function saveNicheBrowserCache() {
+  try {
+    localStorage.setItem('plati-niche-radar-cache', JSON.stringify({
+      trends: NICHE_TRENDS,
+      history: NICHE_HISTORY,
+      meta: NICHE_META,
+      progress: NICHE_PROGRESS
+    }));
+  } catch (_) { /* Browser storage may be full; server snapshots remain the durable cache. */ }
+}
+
+function saveNicheProgressBrowserCache() {
+  try { localStorage.setItem('plati-niche-radar-progress', JSON.stringify(NICHE_PROGRESS)); } catch (_) {}
+}
+
+function renderNicheProgress(progress = {}) {
+  NICHE_PROGRESS = progress || {};
+  const box = document.getElementById('radarProgressBox');
+  const status = NICHE_PROGRESS.status || 'idle';
+  const active = status === 'starting' || status === 'collecting';
+  const done = Number(NICHE_PROGRESS.completed_categories || 0);
+  const total = Number(NICHE_PROGRESS.total_categories || 0);
+  const percent = total ? Math.min(100, Math.round(done * 100 / total)) : 0;
+  const cached = Number(NICHE_PROGRESS.products_cached || 0);
+  const pagesDone = Number(NICHE_PROGRESS.completed_pages || 0);
+  const pagesTotal = Number(NICHE_PROGRESS.total_pages || 0);
+  box.style.display = status === 'idle' ? 'none' : 'block';
+  document.getElementById('radarProgressBar').style.width = `${percent}%`;
+  const labels = {
+    starting: 'Запускаю сбор…',
+    collecting: `Собрано категорий: ${done} из ${total}`,
+    completed: `Сбор завершён: ${done} категорий`,
+    interrupted: `Сбор прерван: сохранён прогресс ${done} из ${total} категорий`,
+    error: `Ошибка сбора: ${NICHE_PROGRESS.error || 'неизвестная ошибка'}`
+  };
+  document.getElementById('radarProgressText').textContent = labels[status] || 'Ожидание ежедневного сбора';
+  document.getElementById('radarProgressDetail').textContent = `${NICHE_PROGRESS.active_categories || 0} в работе · ${pagesDone}${pagesTotal ? `/${pagesTotal} страниц` : ' страниц'} · ${cached.toLocaleString('ru-RU')} карточек в кэше`;
+  const note = document.getElementById('radarProgressNote');
+  if (active) {
+    note.textContent = `${NICHE_PROGRESS.current_category ? `В работе/последняя: ${NICHE_PROGRESS.current_category}. ` : ''}Готовые категории сохраняются; после перезапуска они не повторяются, текущая незавершённая категория соберётся заново.`;
+  } else if (status === 'interrupted') {
+    note.textContent = NICHE_PROGRESS.has_checkpoint
+      ? `${NICHE_PROGRESS.error || 'Checkpoint сохранён.'} Нажмите «Продолжить сбор» или перезапустите сервер.`
+      : `${NICHE_PROGRESS.error || 'Предыдущий снимок сохранён.'} Запустите новый сбор, чтобы продолжить обновление.`;
+  } else if (status === 'error') {
+    note.textContent = NICHE_PROGRESS.error || 'Последний кэшированный снимок остаётся доступен.';
+  } else if (status === 'completed') {
+    note.textContent = `Последнее обновление: ${NICHE_PROGRESS.updated_at ? new Date(NICHE_PROGRESS.updated_at * 1000).toLocaleString('ru-RU') : '—'}. Снимок сохранён на диске.`;
+  } else {
+    note.textContent = '';
+  }
+  const button = document.getElementById('radarRefreshBtn');
+  if (active) {
+    button.disabled = true;
+    button.textContent = 'Сбор выполняется…';
+  } else {
+    button.disabled = false;
+    button.textContent = status === 'interrupted' ? 'Продолжить сбор' : 'Снять слепок сейчас';
+  }
+}
+
+async function pollNicheProgress() {
+  try {
+    const res = await fetch('/api/niche-radar/status');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Не удалось получить статус сбора');
+    renderNicheProgress({ ...data.progress, has_checkpoint: data.has_checkpoint });
+    saveNicheProgressBrowserCache();
+    const status = data.progress?.status;
+    if (!data.running && status !== 'starting' && status !== 'collecting') {
+      if (RADAR_POLL_TIMER) clearInterval(RADAR_POLL_TIMER);
+      RADAR_POLL_TIMER = null;
+      if (status === 'completed') await loadNicheRadar(false);
+    }
+  } catch (_) {
+    // Keep polling through transient failures; the checkpoint is on disk.
+  }
+}
+
+function startNichePolling() {
+  if (RADAR_POLL_TIMER) clearInterval(RADAR_POLL_TIMER);
+  RADAR_POLL_TIMER = setInterval(pollNicheProgress, 1200);
+  pollNicheProgress();
+}
+
+async function loadNicheRadar(allowPolling = true) {
   try {
     const res = await fetch('/api/niche-radar');
     const data = await res.json();
@@ -756,8 +854,24 @@ async function loadNicheRadar() {
     NICHE_HISTORY = data.history || [];
     NICHE_META = data;
     renderNicheRadar();
+    renderNicheProgress({ ...data.progress, has_checkpoint: data.has_checkpoint });
+    saveNicheBrowserCache();
     checkNicheAlerts();
+    if (allowPolling && (data.progress?.status === 'starting' || data.progress?.status === 'collecting')) startNichePolling();
   } catch (err) {
+    try {
+      const cached = JSON.parse(localStorage.getItem('plati-niche-radar-cache') || 'null');
+      if (cached) {
+        NICHE_TRENDS = cached.trends || [];
+        NICHE_HISTORY = cached.history || [];
+        NICHE_META = cached.meta || {};
+        const cachedProgress = JSON.parse(localStorage.getItem('plati-niche-radar-progress') || 'null') || cached.progress || {};
+        renderNicheRadar();
+        renderNicheProgress(cachedProgress);
+        document.getElementById('radarProgressNote').textContent = `Сервер временно недоступен (${err.message}). Показаны последние данные из кэша браузера; снимки также хранятся на сервере.`;
+        return;
+      }
+    } catch (_) { /* Ignore malformed or unavailable browser cache. */ }
     document.getElementById('radarResult').innerHTML = `<div class="empty-state">Радар пока недоступен: ${esc(err.message)}. Сервер попробует собрать слепок автоматически.</div>`;
   }
 }
@@ -766,7 +880,7 @@ function drawNicheChart() {
   const svg = document.getElementById('radarChart');
   const points = NICHE_HISTORY.slice(-30);
   if (!points.length) {
-    svg.innerHTML = '<text x="500" y="90" text-anchor="middle" fill="#94a3b8" font-size="14">График появится после первого сравнения снимков</text>';
+    svg.innerHTML = '<text x="500" y="90" text-anchor="middle" fill="#94a3b8" font-size="14">График появится, когда будут доступны два снимка</text>';
     return;
   }
   const max = Math.max(1, ...points.map(p => Number(p.delta_sales || 0)));
@@ -777,7 +891,7 @@ function drawNicheChart() {
   });
   const first = new Date(points[0].captured_at * 1000).toLocaleDateString('ru-RU');
   const last = new Date(points[points.length - 1].captured_at * 1000).toLocaleDateString('ru-RU');
-  svg.innerHTML = `<line x1="30" y1="140" x2="970" y2="140" stroke="#293548"/><polyline points="${xy.join(' ')}" fill="none" stroke="#38bdf8" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>${xy.map(p => {const [x,y]=p.split(',');return `<circle cx="${x}" cy="${y}" r="4" fill="#4ade80"/>`;}).join('')}<text x="30" y="160" fill="#94a3b8" font-size="11">${first}</text><text x="970" y="160" text-anchor="end" fill="#94a3b8" font-size="11">${last}</text><text x="970" y="18" text-anchor="end" fill="#94a3b8" font-size="11">пик: ${max.toLocaleString('ru-RU')} продаж</text>`;
+  svg.innerHTML = `<line x1="30" y1="140" x2="970" y2="140" stroke="#293548"/><polyline points="${xy.join(' ')}" fill="none" stroke="#38bdf8" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>${xy.map((p,i) => {const [x,y]=p.split(',');const hours=(Number(points[i].interval_seconds||0)/3600).toFixed(1);return `<circle cx="${x}" cy="${y}" r="4" fill="#4ade80"><title>+${Number(points[i].delta_sales).toLocaleString('ru-RU')} продаж за ${hours} ч · ${Number(points[i].products_tracked||0).toLocaleString('ru-RU')} карточек</title></circle>`;}).join('')}<text x="30" y="160" fill="#94a3b8" font-size="11">${first}</text><text x="970" y="160" text-anchor="end" fill="#94a3b8" font-size="11">${last}</text><text x="970" y="18" text-anchor="end" fill="#94a3b8" font-size="11">пик: ${max.toLocaleString('ru-RU')} продаж</text>${points.length === 1 ? '<text x="500" y="45" text-anchor="middle" fill="#94a3b8" font-size="12">Пока одно сравнение — история дополнится после следующих снимков</text>' : ''}`;
 }
 
 function renderNicheRadar() {
@@ -882,22 +996,18 @@ function checkNicheAlerts() {
 async function refreshNicheRadar() {
   const btn = document.getElementById('radarRefreshBtn');
   btn.disabled = true;
-  btn.textContent = 'Собираю категории…';
-  document.getElementById('radarResult').innerHTML = '<div class="empty-state">Запрашиваю numsold по категориям маркетплейса. Это может занять несколько минут…</div>';
+  btn.textContent = 'Запускаю сбор…';
+  document.getElementById('radarResult').innerHTML = '<div class="empty-state">Сбор выполняется на сервере. Можно закрыть страницу: готовые категории сохраняются и сбор продолжится после перезапуска.</div>';
   try {
     const res = await fetch('/api/niche-radar', { method: 'POST' });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Ошибка обновления');
-    NICHE_TRENDS = data.trends || [];
-    NICHE_HISTORY = data.history || [];
-    NICHE_META = data;
-    renderNicheRadar();
-    checkNicheAlerts();
+    if (!res.ok) throw new Error(data.error || 'Не удалось запустить сбор');
+    renderNicheProgress({ ...data.progress, has_checkpoint: data.has_checkpoint });
+    saveNicheProgressBrowserCache();
+    startNichePolling();
   } catch (err) {
-    document.getElementById('radarResult').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Ошибка обновления: ${esc(err.message)}</div>`;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Снять слепок сейчас';
+    renderNicheProgress({ ...NICHE_PROGRESS, status: 'error', error: err.message });
+    document.getElementById('radarResult').innerHTML = `<div class="empty-state" style="color:#fca5a5;">Не удалось запустить сбор: ${esc(err.message)}. Последний снимок остаётся сохранён.</div>`;
   }
 }
 
