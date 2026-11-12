@@ -34,7 +34,7 @@ const WEB_UI_HTML: &str = include_str!("ui.html");
 #[derive(Parser, Debug)]
 #[command(
     name = "plati_rust_parser",
-    about = "Веб-интерфейс и парсер выгодных карточек и продавцов Plati.Market"
+    about = "Нативный радар и парсер Plati.Market"
 )]
 struct Cli {
     /// Папка для сохранения отчётов (JSON, CSV)
@@ -55,7 +55,10 @@ enum SortMode {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Запустить удобный локальный веб-интерфейс (режим по умолчанию)
+    /// Запустить нативное приложение с радаром (режим по умолчанию)
+    Desktop,
+
+    /// Запустить веб-интерфейс
     Serve {
         /// Порт веб-сервера
         #[arg(short, long, default_value_t = 8080)]
@@ -1892,11 +1895,11 @@ async fn api_discover_sellers_handler(
     (StatusCode::OK, Json(json!({ "sellers": sellers })))
 }
 
-async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
-    if !niche_checkpoint_path(&out_dir).exists() {
-        let mut progress = read_niche_progress(&out_dir);
+fn normalize_interrupted_niche_progress(out_dir: &Path) -> Result<()> {
+    if !niche_checkpoint_path(out_dir).exists() {
+        let mut progress = read_niche_progress(out_dir);
         if progress.status == "starting" || progress.status == "collecting" {
-            let latest_capture = load_recent_niche_snapshots(&out_dir)
+            let latest_capture = load_recent_niche_snapshots(out_dir)
                 .ok()
                 .and_then(|snapshots| snapshots.first().map(|snapshot| snapshot.captured_at));
             if latest_capture.map(|captured| captured >= progress.started_at.unwrap_or(u64::MAX)).unwrap_or(false) {
@@ -1908,28 +1911,38 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
             }
             progress.active_categories = 0;
             progress.updated_at = unix_now();
-            write_json_atomic(&niche_progress_path(&out_dir), &progress)?;
+            write_json_atomic(&niche_progress_path(out_dir), &progress)?;
         }
     }
+    Ok(())
+}
+
+fn spawn_niche_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            let has_checkpoint = niche_checkpoint_path(&state.out_dir).exists();
+            let needs_capture = has_checkpoint || load_recent_niche_snapshots(&state.out_dir)
+                .ok()
+                .and_then(|snapshots| snapshots.first().map(|snapshot| {
+                    snapshot.captured_at.saturating_add(86_400) <= unix_now()
+                }))
+                .unwrap_or(true);
+            if needs_capture {
+                start_niche_snapshot(state.clone());
+            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+}
+
+async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
+    normalize_interrupted_niche_progress(&out_dir)?;
     let state = AppState {
         client,
         out_dir,
         niche_running: Arc::new(AtomicBool::new(false)),
     };
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            let has_checkpoint = niche_checkpoint_path(&scheduler_state.out_dir).exists();
-            let needs_capture = has_checkpoint || load_recent_niche_snapshots(&scheduler_state.out_dir)
-                .ok()
-                .and_then(|s| s.first().map(|x| x.captured_at.saturating_add(86_400) <= unix_now()))
-                .unwrap_or(true);
-            if needs_capture {
-                start_niche_snapshot(scheduler_state.clone());
-            }
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-        }
-    });
+    spawn_niche_scheduler(state.clone());
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/initial", get(api_initial_handler))
@@ -1955,6 +1968,387 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopPage {
+    Radar,
+    About,
+}
+
+struct NativeRadarApp {
+    state: AppState,
+    page: DesktopPage,
+    trends: Vec<NicheTrend>,
+    history: Vec<NicheHistoryPoint>,
+    progress: NicheProgress,
+    last_reload: Instant,
+    min_delta: String,
+    max_sellers: String,
+    max_price: String,
+    min_markup: String,
+    search: String,
+    category: String,
+    watchlist: BTreeSet<u64>,
+    only_watchlist: bool,
+}
+
+impl NativeRadarApp {
+    fn new(state: AppState) -> Self {
+        let watchlist = fs::read(state.out_dir.join("niche_watchlist.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let mut app = Self {
+            state,
+            page: DesktopPage::Radar,
+            trends: Vec::new(),
+            history: Vec::new(),
+            progress: NicheProgress::default(),
+            last_reload: Instant::now() - Duration::from_secs(5),
+            min_delta: "500".to_string(),
+            max_sellers: "3".to_string(),
+            max_price: String::new(),
+            min_markup: String::new(),
+            search: String::new(),
+            category: String::new(),
+            watchlist,
+            only_watchlist: false,
+        };
+        app.reload_from_disk();
+        app
+    }
+
+    fn reload_from_disk(&mut self) {
+        if let Ok(snapshots) = load_recent_niche_snapshots(&self.state.out_dir) {
+            self.trends = build_niche_trends(&snapshots);
+            self.trends.retain(|row| row.delta_sales.is_some());
+            self.trends.truncate(3_000);
+            self.history = niche_history_for_response(&self.state.out_dir, &snapshots);
+        }
+        self.progress = read_niche_progress(&self.state.out_dir);
+        self.last_reload = Instant::now();
+    }
+
+    fn draw_header(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("native-header").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading(egui::RichText::new("Plati Radar").strong().size(24.0));
+                    ui.label(egui::RichText::new("Нативный радар спроса и конкуренции").color(egui::Color32::from_rgb(148, 163, 184)));
+                });
+                ui.add_space(20.0);
+                let running = self.state.niche_running.load(Ordering::Acquire);
+                let clock_size = if running { 150.0 } else { 132.0 };
+                draw_egui_clock(ui, clock_size, running);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (status_color, status_text) = if running {
+                        (egui::Color32::from_rgb(74, 222, 128), "Идёт сбор")
+                    } else if self.progress.status == "completed" {
+                        (egui::Color32::from_rgb(74, 222, 128), "Снимок сохранён")
+                    } else if self.progress.status == "interrupted" || self.progress.status == "error" {
+                        (egui::Color32::from_rgb(251, 191, 36), "Нужен повторный запуск")
+                    } else {
+                        (egui::Color32::from_rgb(148, 163, 184), "Ожидание")
+                    };
+                    ui.label(egui::RichText::new(status_text).color(status_color).strong());
+                });
+            });
+            ui.add_space(6.0);
+        });
+    }
+
+    fn draw_navigation(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (page, label) in [
+                (DesktopPage::Radar, "Радар пустых ниш"),
+                (DesktopPage::About, "О приложении"),
+            ] {
+                if ui.selectable_label(self.page == page, label).clicked() {
+                    self.page = page;
+                }
+            }
+        });
+        ui.separator();
+    }
+
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        let running = self.state.niche_running.load(Ordering::Acquire);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading("Сбор категорий");
+                    let status = if running || self.progress.status == "starting" || self.progress.status == "collecting" {
+                        "Сканирую каталог Plati.Market"
+                    } else if self.progress.status == "interrupted" {
+                        "Есть сохранённый checkpoint"
+                    } else if self.progress.status == "completed" {
+                        "Последний сбор завершён"
+                    } else {
+                        "Готов к сбору"
+                    };
+                    ui.label(status);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if running {
+                        "Сбор выполняется…"
+                    } else if niche_checkpoint_path(&self.state.out_dir).exists() {
+                        "Продолжить сбор"
+                    } else {
+                        "Снять слепок сейчас"
+                    };
+                    if ui.add_enabled(!running, egui::Button::new(label)).clicked() {
+                        if start_niche_snapshot(self.state.clone()) {
+                            self.progress.status = "starting".to_string();
+                        }
+                    }
+                });
+            });
+
+            let total = self.progress.total_categories;
+            let done = self.progress.completed_categories.min(total);
+            let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+            ui.add(egui::ProgressBar::new(fraction).show_percentage().text(format!("Категории: {} / {}", done, total)));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} активных запросов", self.progress.active_categories));
+                ui.separator();
+                ui.label(format!("Страницы: {} / {}", self.progress.completed_pages, self.progress.total_pages));
+                ui.separator();
+                ui.label(format!("В кэше: {} карточек", self.progress.products_cached));
+                if !self.progress.current_category.is_empty() {
+                    ui.separator();
+                    ui.label(format!("Категория: {}", self.progress.current_category));
+                }
+            });
+            if let Some(error) = &self.progress.error {
+                ui.colored_label(egui::Color32::from_rgb(252, 165, 165), error);
+            }
+            if self.progress.resumed {
+                ui.label(egui::RichText::new("Сбор продолжен из сохранённого checkpoint").color(egui::Color32::from_rgb(125, 211, 252)));
+            }
+        });
+    }
+
+    fn draw_history(&self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("История прироста между снимками").strong());
+            let points: Vec<&NicheHistoryPoint> = self.history.iter().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+            if points.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("График появится после второго снимка с сопоставимыми товарами");
+                });
+                return;
+            }
+            let desired = egui::vec2(ui.available_width(), 132.0);
+            let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(17, 24, 39));
+            let max = points.iter().map(|p| p.delta_sales).max().unwrap_or(1).max(1) as f32;
+            let plot = rect.shrink2(egui::vec2(14.0, 14.0));
+            let coords: Vec<egui::Pos2> = points.iter().enumerate().map(|(i, point)| {
+                let x = if points.len() == 1 { plot.center().x } else { plot.left() + i as f32 * plot.width() / (points.len() - 1) as f32 };
+                let y = plot.bottom() - (point.delta_sales as f32 / max) * plot.height();
+                egui::pos2(x, y)
+            }).collect();
+            for pair in coords.windows(2) {
+                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.5, egui::Color32::from_rgb(56, 189, 248)));
+            }
+            for (index, (point, pos)) in points.iter().zip(coords.iter()).enumerate() {
+                painter.circle_filled(*pos, if points.len() == 1 { 6.0 } else { 3.5 }, egui::Color32::from_rgb(74, 222, 128));
+                if response.hover_pos().map(|mouse| mouse.distance(*pos) < 12.0).unwrap_or(false) {
+                    response.clone().on_hover_text(format!("+{} продаж · {:.1} ч · {} карточек", point.delta_sales, point.interval_seconds as f64 / 3600.0, point.products_tracked));
+                }
+                let _ = index;
+            }
+            if points.len() == 1 {
+                painter.text(plot.center() + egui::vec2(0.0, 22.0), egui::Align2::CENTER_CENTER, "Одна точка — история пополнится после следующих снимков", egui::FontId::proportional(12.0), egui::Color32::from_rgb(148, 163, 184));
+            }
+        });
+    }
+
+    fn draw_radar(&mut self, ui: &mut egui::Ui) {
+        self.draw_progress(ui);
+        ui.add_space(10.0);
+        self.draw_history(ui);
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Поиск");
+                ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Название или продавец").desired_width(190.0));
+                ui.label("Категория");
+                let categories: Vec<String> = self.trends.iter().map(|row| row.product.category.clone()).collect::<HashSet<_>>().into_iter().collect();
+                egui::ComboBox::from_id_source("native-category-filter")
+                    .selected_text(if self.category.is_empty() { "Все" } else { &self.category })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.category, String::new(), "Все");
+                        for category in categories {
+                            ui.selectable_value(&mut self.category, category.clone(), category);
+                        }
+                    });
+                ui.label("Мин. Δ");
+                ui.add(egui::TextEdit::singleline(&mut self.min_delta).desired_width(70.0));
+                ui.label("Макс. продавцов");
+                ui.add(egui::TextEdit::singleline(&mut self.max_sellers).desired_width(55.0));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Макс. цена ₽");
+                ui.add(egui::TextEdit::singleline(&mut self.max_price).hint_text("без лимита").desired_width(90.0));
+                ui.label("Наценка от %");
+                ui.add(egui::TextEdit::singleline(&mut self.min_markup).hint_text("любая").desired_width(70.0));
+                ui.checkbox(&mut self.only_watchlist, "Только отслеживаемые");
+                if ui.button("Обновить кэш").clicked() {
+                    self.reload_from_disk();
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        let min_delta = self.min_delta.parse::<i64>().unwrap_or(0);
+        let max_sellers = self.max_sellers.parse::<usize>().unwrap_or(usize::MAX);
+        let max_price = self.max_price.parse::<f64>().ok();
+        let min_markup = self.min_markup.parse::<f64>().ok();
+        let query = self.search.to_lowercase();
+        let mut rows: Vec<&NicheTrend> = self.trends.iter().filter(|row| {
+            let Some(delta) = row.delta_sales else { return false };
+            delta >= min_delta
+                && row.sellers_count.max(row.listings_count.min(1)) <= max_sellers
+                && max_price.map(|limit| row.product.price_rub <= limit).unwrap_or(true)
+                && min_markup.map(|limit| row.markup_percent.map(|value| value >= limit).unwrap_or(false)).unwrap_or(true)
+                && (self.category.is_empty() || self.category == row.product.category)
+                && (!self.only_watchlist || self.watchlist.contains(&row.product.item_id))
+                && (query.is_empty() || row.product.title.to_lowercase().contains(&query) || row.product.seller_name.to_lowercase().contains(&query))
+        }).collect();
+        rows.sort_by(|a, b| b.opportunity_score.partial_cmp(&a.opportunity_score).unwrap_or(std::cmp::Ordering::Equal));
+        ui.horizontal(|ui| {
+            ui.heading("Возможности");
+            ui.label(format!("{} найдено · показываю до 250", rows.len()));
+            ui.label(format!("{} в отслеживании", self.watchlist.len()));
+        });
+        if !rows.is_empty() && rows[0].delta_sales.unwrap_or(0) >= min_delta {
+            ui.colored_label(egui::Color32::from_rgb(74, 222, 128), format!("Сигнал радара: {} подходящих ниш по текущим фильтрам", rows.len()));
+        }
+        egui::ScrollArea::vertical().max_height(egui::vec2(ui.available_width(), 460.0).y).show(ui, |ui| {
+            egui::Grid::new("native-radar-table").striped(true).min_col_width(45.0).show(ui, |ui| {
+                for heading in ["★", "Балл", "Δ продаж", "Товар / продавец", "Категория", "Продавцы", "Цена", "Медиана", "Наценка", "Ссылка"] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                let mut watchlist_changed = false;
+                for row in rows.into_iter().take(250) {
+                    let is_watched = self.watchlist.contains(&row.product.item_id);
+                    if ui.button(if is_watched { "★" } else { "☆" }).on_hover_text(if is_watched { "Убрать из отслеживания" } else { "Добавить в отслеживание" }).clicked() {
+                        if is_watched {
+                            self.watchlist.remove(&row.product.item_id);
+                        } else {
+                            self.watchlist.insert(row.product.item_id);
+                        }
+                        watchlist_changed = true;
+                    }
+                    ui.label(format!("{:.1}", row.opportunity_score));
+                    ui.colored_label(egui::Color32::from_rgb(74, 222, 128), format!("+{}", row.delta_sales.unwrap_or(0)));
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&row.product.title).strong());
+                        ui.label(egui::RichText::new(&row.product.seller_name).small().color(egui::Color32::from_rgb(148, 163, 184)));
+                    });
+                    ui.label(&row.product.category);
+                    ui.label(format!("{} / {} карточек", row.sellers_count, row.listings_count));
+                    ui.label(format!("{:.0} ₽", row.product.price_rub));
+                    ui.label(row.comparable_median_price_rub.map(|value| format!("{:.0} ₽", value)).unwrap_or_else(|| "—".to_string()));
+                    ui.label(row.markup_percent.map(|value| format!("{:+.0}%", value)).unwrap_or_else(|| "—".to_string()));
+                    ui.hyperlink_to("Открыть", &row.product.item_url);
+                    ui.end_row();
+                }
+                if watchlist_changed {
+                    let _ = write_json_atomic(&self.state.out_dir.join("niche_watchlist.json"), &self.watchlist);
+                }
+            });
+        });
+    }
+}
+
+impl eframe::App for NativeRadarApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
+        if self.last_reload.elapsed() >= Duration::from_secs(1) {
+            self.reload_from_disk();
+        }
+        let running = self.state.niche_running.load(Ordering::Acquire);
+        ctx.request_repaint_after(if running { Duration::from_millis(16) } else { Duration::from_millis(250) });
+        self.draw_header(ctx);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.draw_navigation(ui);
+            match self.page {
+                DesktopPage::Radar => self.draw_radar(ui),
+                DesktopPage::About => {
+                    ui.heading("О Plati Radar");
+                    ui.label("Нативное приложение на Rust и egui. Снимки и checkpoint сохраняются локально в output/.");
+                    ui.label("Веб-интерфейс для прежних инструментов можно запустить отдельно командой: plati_rust_parser serve");
+                }
+            }
+        });
+    }
+}
+
+fn draw_egui_clock(ui: &mut egui::Ui, size: f32, running: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size + 24.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = egui::pos2(rect.center().x, rect.top() + size * 0.48);
+    let radius = size * 0.38;
+    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seconds = epoch.as_secs() % 86_400;
+    let fraction = epoch.subsec_nanos() as f32 / 1_000_000_000.0;
+    let sec = (seconds % 60) as f32 + fraction;
+    let minute = ((seconds / 60) % 60) as f32 + sec / 60.0;
+    let hour = ((seconds / 3_600) % 24) as f32 + minute / 60.0;
+    let pulse = if running { ((epoch.as_secs_f64() * 3.0).sin() * 0.5 + 0.5) as f32 } else { 0.15 };
+    let accent = egui::Color32::from_rgb(56, 189, 248);
+    painter.circle_filled(center, radius + 5.0 + pulse * 3.0, egui::Color32::from_rgba_unmultiplied(56, 189, 248, (22.0 + pulse * 28.0) as u8));
+    painter.circle_filled(center, radius, egui::Color32::from_rgb(17, 24, 39));
+    painter.circle_stroke(center, radius, egui::Stroke::new(2.0, egui::Color32::from_rgb(51, 65, 85)));
+    for tick in 0..60 {
+        let angle = tick as f32 * std::f32::consts::TAU / 60.0 - std::f32::consts::FRAC_PI_2;
+        let major = tick % 5 == 0;
+        let outer = egui::pos2(center.x + angle.cos() * (radius - 5.0), center.y + angle.sin() * (radius - 5.0));
+        let inner_radius = radius - if major { 13.0 } else { 9.0 };
+        let inner = egui::pos2(center.x + angle.cos() * inner_radius, center.y + angle.sin() * inner_radius);
+        painter.line_segment([inner, outer], egui::Stroke::new(if major { 2.0 } else { 1.0 }, if major { egui::Color32::from_rgb(203, 213, 225) } else { egui::Color32::from_rgb(71, 85, 105) }));
+    }
+    let hand = |fraction: f32, length: f32| {
+        let angle = fraction * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+        egui::pos2(center.x + angle.cos() * length, center.y + angle.sin() * length)
+    };
+    painter.line_segment([center, hand(hour / 12.0, radius * 0.48)], egui::Stroke::new(4.0, egui::Color32::from_rgb(226, 232, 240)));
+    painter.line_segment([center, hand(minute / 60.0, radius * 0.69)], egui::Stroke::new(2.5, egui::Color32::from_rgb(125, 211, 252)));
+    painter.line_segment([center, hand(sec / 60.0, radius * 0.80)], egui::Stroke::new(1.3, accent));
+    painter.circle_filled(center, 4.0, accent);
+    let hh = seconds / 3_600;
+    let mm = (seconds / 60) % 60;
+    let ss = seconds % 60;
+    painter.text(egui::pos2(rect.center().x, rect.bottom() - 10.0), egui::Align2::CENTER_CENTER,
+        format!("{:02}:{:02}:{:02} UTC", hh, mm, ss), egui::FontId::proportional(12.0), egui::Color32::from_rgb(203, 213, 225));
+}
+
+fn run_desktop_app(client: Client, out_dir: PathBuf) -> Result<()> {
+    normalize_interrupted_niche_progress(&out_dir)?;
+    let state = AppState {
+        client,
+        out_dir,
+        niche_running: Arc::new(AtomicBool::new(false)),
+    };
+    spawn_niche_scheduler(state.clone());
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1440.0, 960.0])
+            .with_min_inner_size([980.0, 700.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Plati Radar",
+        options,
+        Box::new(move |_creation_context| Ok(Box::new(NativeRadarApp::new(state)))),
+    )
+    .map_err(|error| anyhow::anyhow!("Не удалось запустить нативное окно: {}", error))
+}
+
 // ======================= MAIN =======================
 
 #[tokio::main]
@@ -1962,7 +2356,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = build_client()?;
 
-    match cli.command.unwrap_or(Commands::Serve { port: 8080 }) {
+    match cli.command.unwrap_or(Commands::Desktop) {
+        Commands::Desktop => {
+            // eframe owns the UI thread; let Tokio's multi-thread runtime keep
+            // driving the scheduler and snapshot task while the window is open.
+            tokio::task::block_in_place(|| run_desktop_app(client, cli.out_dir))?;
+        }
+
         Commands::Serve { port } => {
             run_web_server(client, cli.out_dir, port).await?;
         }
