@@ -1461,7 +1461,19 @@ fn niche_title_key(title: &str) -> String {
     }
 }
 
-fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
+#[derive(Debug, Clone, Copy)]
+struct NicheMetric {
+    product_index: usize,
+    previous_sold_count: Option<u64>,
+    delta_sales: Option<i64>,
+    listings_count: usize,
+    sellers_count: usize,
+    comparable_median_price_rub: Option<f64>,
+    markup_percent: Option<f64>,
+    opportunity_score: f64,
+}
+
+fn build_niche_metrics(snapshots: &[NicheSnapshot]) -> Vec<NicheMetric> {
     let Some(current) = snapshots.first() else { return Vec::new() };
     let previous: BTreeMap<u64, u64> = previous_daily_snapshot(snapshots)
         .map(|s| s.products.iter().map(|p| (p.item_id, p.sold_count)).collect())
@@ -1485,7 +1497,7 @@ fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
         } else { None };
         (key, median)
     }).collect();
-    let mut trends: Vec<NicheTrend> = current.products.iter().map(|product| {
+    current.products.iter().enumerate().map(|(product_index, product)| {
         let key = niche_title_key(&product.title);
         let median = price_benchmarks.get(&key).copied().flatten();
         let markup = median.filter(|m| *m > 0.0).map(|m| ((product.price_rub / m - 1.0) * 100.0).round());
@@ -1500,8 +1512,8 @@ fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
         let supply_score = 35.0 / (sellers_count.max(1) as f64).sqrt();
         let markup_score = markup.unwrap_or(0.0).clamp(0.0, 200.0) * 0.1;
         let opportunity_score = (demand_score + supply_score + markup_score).clamp(0.0, 100.0);
-        NicheTrend {
-            product: product.clone(),
+        NicheMetric {
+            product_index,
             previous_sold_count: old,
             delta_sales: delta,
             listings_count: *title_counts.get(&key).unwrap_or(&1),
@@ -1510,6 +1522,20 @@ fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
             markup_percent: markup,
             opportunity_score: (opportunity_score * 10.0).round() / 10.0,
         }
+    }).collect()
+}
+
+fn build_niche_trends(snapshots: &[NicheSnapshot]) -> Vec<NicheTrend> {
+    let Some(current) = snapshots.first() else { return Vec::new() };
+    let mut trends: Vec<NicheTrend> = build_niche_metrics(snapshots).into_iter().map(|metric| NicheTrend {
+        product: current.products[metric.product_index].clone(),
+        previous_sold_count: metric.previous_sold_count,
+        delta_sales: metric.delta_sales,
+        listings_count: metric.listings_count,
+        sellers_count: metric.sellers_count,
+        comparable_median_price_rub: metric.comparable_median_price_rub,
+        markup_percent: metric.markup_percent,
+        opportunity_score: metric.opportunity_score,
     }).collect();
     trends.sort_by(|a, b| b.opportunity_score.partial_cmp(&a.opportunity_score).unwrap_or(std::cmp::Ordering::Equal));
     trends

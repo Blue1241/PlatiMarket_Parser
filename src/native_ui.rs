@@ -36,6 +36,11 @@ impl ExportFormat { fn extension(self)->&'static str {match self{Self::Csv=>"csv
 #[derive(Clone)]
 struct NoteEditor { item_id:Option<u64>, seller_id:Option<u64>, note:String, tags:String }
 
+#[derive(Clone)]
+struct RadarChange { title:String, detail:String, sales:i64, price:f64 }
+#[derive(Clone)]
+struct RadarComparison { current_at:u64, previous_at:u64, total_changes:usize, added:usize, missing:usize, top_changes:Vec<RadarChange> }
+
 fn default_one() -> usize { 1 }
 fn default_delay_ms() -> u64 { 250 }
 fn default_request_concurrency() -> usize { 4 }
@@ -162,6 +167,9 @@ enum UiMessage {
     Options(Result<(u64, String, f64, Vec<UiOptionGroup>), String>),
     NicheStarted,
     Niche(Result<(), String>),
+    RadarSnapshotsLoaded(Vec<NicheSnapshot>, Vec<NicheHistoryPoint>),
+    RadarDerived(Vec<NicheMetric>, RadarComparison),
+    RadarVisible(String, Vec<usize>),
 }
 
 struct PlatiApp {
@@ -204,8 +212,15 @@ struct PlatiApp {
     radar_prefs_shared: Arc<std::sync::RwLock<RadarAlertPrefs>>,
 
     progress: NicheProgress,
-    snapshots: Vec<NicheSnapshot>,
+    snapshots: Arc<Vec<NicheSnapshot>>,
     history: Vec<NicheHistoryPoint>,
+    radar_snapshots_loading: bool,
+    radar_metrics: Arc<Vec<NicheMetric>>,
+    radar_comparison: Option<RadarComparison>,
+    radar_derived_loading: bool,
+    radar_visible: Vec<usize>,
+    radar_filter_key: String,
+    radar_visible_loading: bool,
     niche_filter: String,
     min_delta: i64,
     max_sellers: usize,
@@ -259,8 +274,8 @@ impl PlatiApp {
         let deals = read_json_or(out_dir.join("deals.json"), Vec::new());
         let sellers = read_json_or(out_dir.join("plati_sellers.json"), Vec::new());
         let favorites = read_json_or(out_dir.join("niche_favorites.json"), HashSet::new());
-        let snapshots = load_recent_niche_snapshots(&out_dir).unwrap_or_default();
-        let history = niche_history_for_response(&out_dir, &snapshots);
+        let snapshots = Vec::new();
+        let history = Vec::new();
         let progress = read_niche_progress(&out_dir);
         let watchlist = read_json_or(out_dir.join("watchlist.json"), Vec::new());
         let watched_sellers = read_json_or(out_dir.join("watched_sellers.json"), Vec::new());
@@ -274,8 +289,9 @@ impl PlatiApp {
             max_categories: settings.max_categories, enrich_limit: settings.enrich_limit, sellers, seller_sort: settings.seller_sort, sellers_filter: settings.sellers_filter.clone(), discover_busy: false,
             discover_cancel: None, discover_progress: (0, 0, String::new()),
             niche_running: Arc::new(AtomicBool::new(false)), capture_task: Arc::new(std::sync::Mutex::new(None)),
-            radar_prefs_shared: Arc::new(std::sync::RwLock::new(RadarAlertPrefs{enabled:settings.notify_growth,min_delta:settings.min_delta,max_sellers:settings.max_sellers,text_filter:settings.alert_filter.clone(),tracked_sellers_only:settings.tracked_sellers_only,seller_ids:watched_sellers.iter().map(|s:&WatchedSeller|s.seller_id).collect()})), progress, snapshots, history,
+            radar_prefs_shared: Arc::new(std::sync::RwLock::new(RadarAlertPrefs{enabled:settings.notify_growth,min_delta:settings.min_delta,max_sellers:settings.max_sellers,text_filter:settings.alert_filter.clone(),tracked_sellers_only:settings.tracked_sellers_only,seller_ids:watched_sellers.iter().map(|s:&WatchedSeller|s.seller_id).collect()})), progress, snapshots:Arc::new(snapshots), history,
             niche_filter: settings.niche_filter.clone(), min_delta: settings.min_delta, max_sellers: settings.max_sellers, max_price: settings.max_price, max_markup: settings.max_markup, radar_sort: settings.radar_sort, favorites,
+            radar_metrics:Arc::new(Vec::new()),radar_comparison:None,radar_snapshots_loading:true,radar_derived_loading:false,radar_visible:Vec::new(),radar_filter_key:String::new(),radar_visible_loading:false,
             favorites_only: settings.favorites_only, notify_growth: settings.notify_growth, options_open: false, options_busy: false,
             options_id: 0, options_title: String::new(), options_base: 0.0,
             options: Vec::new(), option_selection: BTreeMap::new(),
@@ -290,6 +306,7 @@ impl PlatiApp {
             request_delay_ms:settings.request_delay_ms,request_concurrency:settings.request_concurrency,retention_days:settings.retention_days,history_limit:settings.history_limit,
             watch_filter:String::new(),export_draft:None,note_editor:None,
         };
+        app.reload_radar();
         app.start_radar_scheduler();
         app
     }
@@ -739,17 +756,28 @@ impl PlatiApp {
                         Err(e) => self.message = format!("Ошибка загрузки тарифов: {e}"),
                     }
                 }
+                UiMessage::RadarSnapshotsLoaded(snapshots,history) => {
+                    self.snapshots=Arc::new(snapshots);
+                    self.history=history;
+                    self.radar_snapshots_loading=false;
+                    self.refresh_radar_derived();
+                }
+                UiMessage::RadarDerived(metrics,comparison) => {
+                    self.radar_metrics=Arc::new(metrics);
+                    self.radar_comparison=Some(comparison);
+                    self.radar_derived_loading=false;
+                    self.radar_filter_key.clear();
+                }
+                UiMessage::RadarVisible(key,visible) => {
+                    if key==self.radar_filter_key{self.radar_visible=visible;self.radar_visible_loading=false;}
+                }
                 UiMessage::NicheStarted => self.record_task("Сбор радара","Запущено",String::new()),
                 UiMessage::Niche(result) => {
                     self.reload_radar();
                     match &result { Ok(())=>self.record_task("Сбор радара","Завершено",format!("снимков: {}",self.snapshots.len())), Err(e)=>self.record_task("Сбор радара","Ошибка",e.clone()) };
                     self.message = match result {
                         Err(e) => format!("Ошибка радара: {e}"),
-                        Ok(()) => {
-                            let prefs=self.radar_alert_prefs();
-                            let count = build_niche_trends(&self.snapshots).iter().filter(|t| matches_alert_target(&prefs,&t.product.title,&t.product.category,t.product.seller_id)&&t.delta_sales.unwrap_or(i64::MIN)>=prefs.min_delta&&t.sellers_count<=prefs.max_sellers).count();
-                            if self.notify_growth && count > 0 { format!("Радар: найдено {count} возможностей по текущим порогам") } else { "Снимок радара сохранён".into() }
-                        }
+                        Ok(()) => "Снимок радара сохранён · подготовка таблиц выполняется в фоне".into(),
                     };
                 }
             }
@@ -759,8 +787,55 @@ impl PlatiApp {
     }
 
     fn reload_radar(&mut self) {
-        self.snapshots = load_recent_niche_snapshots(&self.out_dir).unwrap_or_default();
-        self.history = niche_history_for_response(&self.out_dir, &self.snapshots);
+        self.radar_snapshots_loading=true;
+        self.radar_derived_loading=true;
+        let out_dir=self.out_dir.clone();let tx=self.tx.clone();
+        self.runtime.spawn_blocking(move||{
+            let snapshots=load_recent_niche_snapshots(&out_dir).unwrap_or_default();
+            let history=niche_history_for_response(&out_dir,&snapshots);
+            let _=tx.send(UiMessage::RadarSnapshotsLoaded(snapshots,history));
+        });
+    }
+
+    fn refresh_radar_derived(&mut self) {
+        self.radar_derived_loading=true;
+        self.radar_filter_key.clear();
+        let snapshots=self.snapshots.clone();
+        let tx=self.tx.clone();
+        self.runtime.spawn_blocking(move||{
+            let metrics=build_niche_metrics(snapshots.as_slice());
+            let comparison=build_snapshot_comparison(snapshots.as_slice());
+            let _=tx.send(UiMessage::RadarDerived(metrics,comparison));
+        });
+    }
+
+    fn refresh_radar_visible(&mut self) {
+        let key=format!("{}|{}|{}|{}|{}|{}|{}|{}|{}",self.niche_filter.to_lowercase(),self.min_delta,self.max_sellers,self.max_price.to_bits(),self.max_markup.to_bits(),radar_sort_name(self.radar_sort),self.favorites_only,self.favorites.len(),self.radar_metrics.len());
+        if key==self.radar_filter_key{return;}
+        self.radar_filter_key=key.clone();
+        self.radar_visible_loading=true;
+        let metrics=self.radar_metrics.clone();let snapshots=self.snapshots.clone();let tx=self.tx.clone();
+        let filter=self.niche_filter.trim().to_lowercase();let min_delta=self.min_delta;let max_sellers=self.max_sellers;
+        let max_price=self.max_price;let max_markup=self.max_markup;let favorites=self.favorites.clone();
+        let favorites_only=self.favorites_only;let sort=self.radar_sort;
+        self.runtime.spawn_blocking(move||{
+            let Some(current)=snapshots.first() else{let _=tx.send(UiMessage::RadarVisible(key,Vec::new()));return;};
+            let mut visible:Vec<usize>=metrics.iter().enumerate().filter_map(|(i,m)|{
+                let product=current.products.get(m.product_index)?;
+                let matches=m.delta_sales.unwrap_or(i64::MIN)>=min_delta&&m.sellers_count<=max_sellers
+                    &&product.price_rub<=max_price&&m.markup_percent.map(|x|x<=max_markup).unwrap_or(true)
+                    &&(!favorites_only||favorites.contains(&product.item_id))
+                    &&(filter.is_empty()||product.title.to_lowercase().contains(&filter)||product.category.to_lowercase().contains(&filter));
+                matches.then_some(i)
+            }).collect();
+            let compare=|&ia:&usize,&ib:&usize|{
+                let a=&metrics[ia];let b=&metrics[ib];
+                match sort{RadarSort::Opportunity=>b.opportunity_score.partial_cmp(&a.opportunity_score).unwrap_or(std::cmp::Ordering::Equal),RadarSort::Delta=>b.delta_sales.unwrap_or(i64::MIN).cmp(&a.delta_sales.unwrap_or(i64::MIN)),RadarSort::Price=>current.products[a.product_index].price_rub.partial_cmp(&current.products[b.product_index].price_rub).unwrap_or(std::cmp::Ordering::Equal),RadarSort::Sellers=>a.sellers_count.cmp(&b.sellers_count)}
+            };
+            if visible.len()>2000{visible.select_nth_unstable_by(1999,compare);visible.truncate(2000);}
+            visible.sort_by(compare);
+            let _=tx.send(UiMessage::RadarVisible(key,visible));
+        });
     }
 
     fn radar_alert_prefs(&self) -> RadarAlertPrefs {
@@ -935,6 +1010,7 @@ impl PlatiApp {
     }
 
     fn deals_view(&mut self, ui: &mut egui::Ui) {
+        let results_height=(ui.available_height()-330.0).max(360.0);
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Быстрый поиск").strong());
@@ -996,7 +1072,7 @@ impl PlatiApp {
             });
         });
         card(ui,|ui|{
-            egui::ScrollArea::both().max_height(500.0).show(ui,|ui|{
+            egui::ScrollArea::both().min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
                 egui::Grid::new("deal_rows").striped(true).spacing([12.0,8.0]).min_col_width(55.0).show(ui,|ui|{
                     ui.label(RichText::new("Карточка").strong().color(Color32::from_rgb(125,211,252)));
                     ui.label(RichText::new("Тариф").strong().color(Color32::from_rgb(125,211,252)));
@@ -1095,20 +1171,19 @@ impl PlatiApp {
             ui.horizontal(|ui|{
                 ui.vertical(|ui|{ui.heading("Ниши и продажи");let s=self.snapshots.first();ui.label(format!("Снимок: {} · {} категорий · {} товаров",s.map(|x|date(x.captured_at)).unwrap_or_else(||"нет".into()),s.map(|x|x.categories_scanned).unwrap_or(0),s.map(|x|x.products.len()).unwrap_or(0)));});
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                    if self.niche_running.load(Ordering::Acquire) {
-                        if ui.button("Отменить сбор").clicked() { self.cancel_capture(); }
-                    } else if ui.add(egui::Button::new("Обновить снимок").fill(Color32::from_rgb(2,132,199))).clicked() {
-                        start_capture(self.client.clone(),self.out_dir.clone(),self.tx.clone(),self.niche_running.clone(),self.runtime.handle().clone(),self.capture_task.clone(),self.radar_alert_prefs());
-                    }
+                    if self.niche_running.load(Ordering::Acquire) {if ui.button("Отменить сбор").clicked(){self.cancel_capture();}}
+                    else if ui.add(egui::Button::new("Обновить снимок").fill(Color32::from_rgb(2,132,199))).clicked(){start_capture(self.client.clone(),self.out_dir.clone(),self.tx.clone(),self.niche_running.clone(),self.runtime.handle().clone(),self.capture_task.clone(),self.radar_alert_prefs());}
                 });
             });
+            if self.radar_snapshots_loading{ui.horizontal(|ui|{ui.spinner();ui.label("Загрузка снимков радара в фоне…");});}
             if self.niche_running.load(Ordering::Acquire)||matches!(self.progress.status.as_str(),"starting"|"collecting"){
                 let f=if self.progress.total_categories==0{0.0}else{self.progress.completed_categories as f32/self.progress.total_categories as f32};
                 ui.add(egui::ProgressBar::new(f).show_percentage().text(format!("{} / {} категорий · {} страниц · {} товаров",self.progress.completed_categories,self.progress.total_categories,self.progress.completed_pages,self.progress.products_cached)));
                 if !self.progress.current_category.is_empty(){ui.label(format!("Сейчас: {}",self.progress.current_category));}
             }
             if let Some(e)=&self.progress.error{ui.colored_label(Color32::LIGHT_RED,e);}
-        }); self.message(ui);
+        });
+        self.message(ui);
         card(ui,|ui|{ui.label(RichText::new("История изменения продаж").strong());history_plot(ui,&self.history);});
         card(ui,|ui|{ui.label(RichText::new("Что изменилось с прошлого снимка").strong());self.snapshot_comparison(ui);});
         ui.horizontal_wrapped(|ui|{
@@ -1116,27 +1191,33 @@ impl PlatiApp {
             ui.label("Мин. Δ");ui.add(egui::DragValue::new(&mut self.min_delta).range(-1_000_000..=1_000_000));ui.label("Макс. продавцов");ui.add(egui::DragValue::new(&mut self.max_sellers).range(1..=100_000));
             ui.label("Макс. цена");ui.add(egui::DragValue::new(&mut self.max_price).range(0.0..=100_000_000.0));ui.label("Макс. наценка %");ui.add(egui::DragValue::new(&mut self.max_markup).range(-100.0..=100_000.0));
             egui::ComboBox::from_id_salt("radar_sort").selected_text(radar_sort_name(self.radar_sort)).show_ui(ui,|ui|{for s in [RadarSort::Opportunity,RadarSort::Delta,RadarSort::Price,RadarSort::Sellers]{ui.selectable_value(&mut self.radar_sort,s,radar_sort_name(s));}});
-            ui.checkbox(&mut self.favorites_only,"Избранное");
-            ui.checkbox(&mut self.notify_growth,"Оповещать о совпадениях");
-            if ui.button("Экспорт / настроить…").clicked(){let rows=build_niche_trends(&self.snapshots);self.prepare_export("Радар ниш","niche_radar",&rows);}
+            ui.checkbox(&mut self.favorites_only,"Избранное");ui.checkbox(&mut self.notify_growth,"Оповещать о совпадениях");
+            if ui.button("Экспорт / настроить…").clicked(){let rows=self.radar_metrics.iter().filter_map(|m|self.snapshots.first()?.products.get(m.product_index).map(|p|NicheTrend{product:p.clone(),previous_sold_count:m.previous_sold_count,delta_sales:m.delta_sales,listings_count:m.listings_count,sellers_count:m.sellers_count,comparable_median_price_rub:m.comparable_median_price_rub,markup_percent:m.markup_percent,opportunity_score:m.opportunity_score})).collect::<Vec<_>>();self.prepare_export("Радар ниш","niche_radar",&rows);}
         });
+        self.refresh_radar_visible();
         card(ui,|ui|{
-            let mut trends=build_niche_trends(&self.snapshots);
-            let f=self.niche_filter.to_lowercase();
-            trends.retain(|t|t.delta_sales.unwrap_or(i64::MIN)>=self.min_delta&&t.sellers_count<=self.max_sellers&&t.product.price_rub<=self.max_price&&t.markup_percent.map(|x|x<=self.max_markup).unwrap_or(true)&&(!self.favorites_only||self.favorites.contains(&t.product.item_id))&&(f.is_empty()||t.product.title.to_lowercase().contains(&f)||t.product.category.to_lowercase().contains(&f)));
-            trends.sort_by(|a,b|match self.radar_sort{RadarSort::Opportunity=>b.opportunity_score.partial_cmp(&a.opportunity_score).unwrap_or(std::cmp::Ordering::Equal),RadarSort::Delta=>b.delta_sales.unwrap_or(i64::MIN).cmp(&a.delta_sales.unwrap_or(i64::MIN)),RadarSort::Price=>a.product.price_rub.partial_cmp(&b.product.price_rub).unwrap_or(std::cmp::Ordering::Equal),RadarSort::Sellers=>a.sellers_count.cmp(&b.sellers_count)});
-            trends.truncate(2000);
-            egui::ScrollArea::both().max_height(480.0).show(ui,|ui|{
-                egui::Grid::new("niche_table").striped(true).spacing([12.0,7.0]).show(ui,|ui|{
-                    for h in ["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"]{ui.label(RichText::new(h).strong().color(Color32::from_rgb(125,211,252)));}ui.end_row();
-                    for t in trends{
-                        let yes=self.favorites.contains(&t.product.item_id);
-                        if ui.button(if yes{"★"}else{"☆"}).clicked(){if yes{self.favorites.remove(&t.product.item_id);}else{self.favorites.insert(t.product.item_id);}let _=write_json_atomic(&self.out_dir.join("niche_favorites.json"),&self.favorites);}
-                        ui.vertical(|ui|{ui.hyperlink_to(&t.product.title,&t.product.item_url);ui.label(RichText::new(&t.product.category).small().color(Color32::GRAY));});
-                        ui.label(t.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()));ui.label(format!("{:.0} ₽",t.product.price_rub));ui.label(format!("{} / {}",t.sellers_count,t.listings_count));ui.label(t.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into()));ui.label(format!("{:.1}",t.opportunity_score));ui.end_row();
-                    }
-                });
+            ui.horizontal(|ui|{ui.label(RichText::new(format!("Возможности · {}{}",self.radar_visible.len(),if self.radar_visible.len()==2000{"+"}else{""})).strong());if self.radar_derived_loading||self.radar_visible_loading{ui.spinner();ui.label("Подготовка данных в фоне…");}else if self.radar_metrics.is_empty(){ui.label("Нет данных радара");}});
+            if self.radar_derived_loading||self.radar_visible_loading {return;}
+            let Some(current)=self.snapshots.first() else{return;};
+            ui.horizontal(|ui|{for h in ["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"]{ui.label(RichText::new(h).strong().color(Color32::from_rgb(125,211,252)));}});
+            let mut toggle_favorite=None;
+            egui::ScrollArea::both().max_height(ui.available_height().max(360.0)).show_rows(ui,58.0,self.radar_visible.len(),|ui,range|{
+                for row in range {
+                    let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
+                    let Some(product)=current.products.get(m.product_index) else{continue;};
+                    ui.horizontal(|ui|{
+                        let yes=self.favorites.contains(&product.item_id);
+                        if ui.button(if yes{"★"}else{"☆"}).clicked(){toggle_favorite=Some(product.item_id);}
+                        ui.allocate_ui_with_layout(egui::vec2(340.0,56.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{ui.hyperlink_to(&product.title,&product.item_url);ui.label(RichText::new(&product.category).small().color(Color32::GRAY));});
+                        ui.add_sized([82.0,24.0],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())));
+                        ui.add_sized([90.0,24.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));
+                        ui.add_sized([90.0,24.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));
+                        ui.add_sized([90.0,24.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));
+                        ui.add_sized([50.0,24.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));
+                    });
+                }
             });
+            if let Some(id)=toggle_favorite{if self.favorites.remove(&id)==false{self.favorites.insert(id);}let _=write_json_atomic(&self.out_dir.join("niche_favorites.json"),&self.favorites);self.radar_filter_key.clear();}
             if self.snapshots.len()<2{ui.label(RichText::new("Для сравнения нужны два снимка; первый запускается автоматически.").small().color(Color32::GRAY));}
         });
     }
@@ -1194,18 +1275,16 @@ impl PlatiApp {
     }
 
     fn snapshot_comparison(&self,ui:&mut egui::Ui) {
-        if self.snapshots.len()<2 {ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;}
-        let current=&self.snapshots[0];let previous=&self.snapshots[1];
-        let old:HashMap<u64,&NicheProduct>=previous.products.iter().map(|p|(p.item_id,p)).collect();
-        let new_ids:HashSet<u64>=current.products.iter().map(|p|p.item_id).collect();
-        let group_counts=|products:&[NicheProduct]|{let mut groups:HashMap<String,HashSet<u64>>=HashMap::new();for p in products{groups.entry(niche_title_key(&p.title)).or_default().insert(p.seller_id);}groups.into_iter().map(|(k,v)|(k,v.len())).collect::<HashMap<_,_>>()};
-        let old_groups=group_counts(&previous.products);let new_groups=group_counts(&current.products);
-        let mut changes:Vec<(String,String,i64,f64)>=Vec::new();
-        for p in &current.products {if let Some(oldp)=old.get(&p.item_id){let sold=p.sold_count as i64-oldp.sold_count as i64;let price=p.price_rub-oldp.price_rub;let key=niche_title_key(&p.title);let competition=new_groups.get(&key).copied().unwrap_or(0) as i64-old_groups.get(&key).copied().unwrap_or(0) as i64;let mut parts=Vec::new();if sold!=0{parts.push(format!("Продажи {sold:+}"));}if price.abs()>=0.01{parts.push(format!("Цена {price:+.0} ₽"));}if competition!=0{parts.push(format!("Продавцы {competition:+}"));}if !parts.is_empty(){changes.push((p.title.clone(),parts.join(" · "),sold,price));}}else{changes.push((p.title.clone(),"Новая карточка".into(),0,0.0));}}
-        for p in &previous.products {if !new_ids.contains(&p.item_id){changes.push((p.title.clone(),"Не найдена в новом снимке".into(),0,0.0));}}
-        changes.sort_by(|a,b|b.2.cmp(&a.2).then_with(||a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal)));
-        ui.label(format!("{} → {} · найдено {} изменений · +{} новых · −{} пропавших",date(previous.captured_at),date(current.captured_at),changes.len(),current.products.iter().filter(|p|!old.contains_key(&p.item_id)).count(),previous.products.iter().filter(|p|!new_ids.contains(&p.item_id)).count()));
-        egui::ScrollArea::vertical().max_height(220.0).show(ui,|ui|{for(title,change,_,_)in changes.iter().take(60){ui.horizontal(|ui|{ui.label(RichText::new(change).strong().color(Color32::from_rgb(125,211,252)));ui.label(title);});}});
+        if self.radar_derived_loading {ui.horizontal(|ui|{ui.spinner();ui.label("Сравнение снимков рассчитывается в фоне…");});return;}
+        let Some(comparison)=&self.radar_comparison else{ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;};
+        if comparison.previous_at==0 {ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;}
+        ui.label(format!("{} → {} · найдено {} изменений · +{} новых · −{} пропавших",date(comparison.previous_at),date(comparison.current_at),comparison.total_changes,comparison.added,comparison.missing));
+        egui::ScrollArea::vertical().max_height(220.0).show(ui,|ui|{
+            for change in &comparison.top_changes {
+                ui.horizontal(|ui|{ui.label(RichText::new(&change.detail).strong().color(Color32::from_rgb(125,211,252)));ui.label(&change.title);});
+            }
+            if comparison.total_changes>comparison.top_changes.len(){ui.label(RichText::new(format!("Показаны наиболее заметные {} из {} изменений",comparison.top_changes.len(),comparison.total_changes)).small().color(Color32::GRAY));}
+        });
     }
 
     fn activity_view(&mut self,ui:&mut egui::Ui) {
@@ -1291,6 +1370,41 @@ fn matches_alert_target(prefs:&RadarAlertPrefs,title:&str,category:&str,seller_i
     matches_text&&matches_seller
 }
 
+fn build_snapshot_comparison(snapshots:&[NicheSnapshot])->RadarComparison {
+    if snapshots.len()<2{return RadarComparison{current_at:snapshots.first().map(|s|s.captured_at).unwrap_or(0),previous_at:0,total_changes:0,added:0,missing:0,top_changes:Vec::new()};}
+    let current=&snapshots[0];let previous=&snapshots[1];
+    let old:HashMap<u64,&NicheProduct>=previous.products.iter().map(|p|(p.item_id,p)).collect();
+    let new:HashMap<u64,&NicheProduct>=current.products.iter().map(|p|(p.item_id,p)).collect();
+    let group_counts=|products:&[NicheProduct]|{
+        let mut groups:HashMap<String,HashSet<u64>>=HashMap::new();
+        for product in products{groups.entry(niche_title_key(&product.title)).or_default().insert(product.seller_id);}
+        groups.into_iter().map(|(key,sellers)|(key,sellers.len())).collect::<HashMap<_,_>>()
+    };
+    let old_groups=group_counts(&previous.products);let new_groups=group_counts(&current.products);
+    let mut total_changes=0;let mut added=0;let mut missing=0;let mut top_changes:Vec<RadarChange>=Vec::with_capacity(60);
+    let mut consider=|title:&str,detail:String,sales:i64,price:f64|{
+        total_changes+=1;
+        let better=top_changes.len()<60||top_changes.last().map(|last|sales>last.sales||(sales==last.sales&&price<last.price)).unwrap_or(true);
+        if better {
+            let item=RadarChange{title:title.to_owned(),detail,sales,price};
+            let position=top_changes.iter().position(|other|sales>other.sales||(sales==other.sales&&price<other.price)).unwrap_or(top_changes.len());
+            top_changes.insert(position,item);if top_changes.len()>60{top_changes.pop();}
+        }
+    };
+    for product in &current.products {
+        if let Some(old_product)=old.get(&product.item_id){
+            let sales=product.sold_count as i64-old_product.sold_count as i64;let price=product.price_rub-old_product.price_rub;
+            let key=niche_title_key(&product.title);
+            let competition=new_groups.get(&key).copied().unwrap_or(0) as i64-old_groups.get(&key).copied().unwrap_or(0) as i64;
+            let mut parts=Vec::new();if sales!=0{parts.push(format!("Продажи {sales:+}"));}if price.abs()>=0.01{parts.push(format!("Цена {price:+.0} ₽"));}if competition!=0{parts.push(format!("Продавцы {competition:+}"));}
+            if !parts.is_empty(){consider(&product.title,parts.join(" · "),sales,price);}
+        }else{added+=1;consider(&product.title,"Новая карточка".into(),0,0.0);}
+    }
+    for product in &previous.products{if !new.contains_key(&product.item_id){missing+=1;consider(&product.title,"Не найдена в новом снимке".into(),0,0.0);}}
+    drop(consider);
+    RadarComparison{current_at:current.captured_at,previous_at:previous.captured_at,total_changes,added,missing,top_changes}
+}
+
 fn export_cell(value:&serde_json::Value)->String {
     match value {serde_json::Value::Null=>String::new(),serde_json::Value::String(s)=>s.clone(),serde_json::Value::Number(n)=>n.to_string(),serde_json::Value::Bool(b)=>b.to_string(),other=>other.to_string()}
 }
@@ -1356,6 +1470,7 @@ fn empty(ui:&mut egui::Ui,title:&str,desc:&str){card(ui,|ui|{ui.vertical_centere
 fn date(ts:u64)->String{let age=unix_now().saturating_sub(ts);if age<3600{format!("{} мин. назад",age/60)}else if age<86_400{format!("{} ч. назад",age/3600)}else{format!("{} дн. назад",age/86_400)}}
 
 fn history_plot(ui:&mut egui::Ui,history:&[NicheHistoryPoint]){
+    let history=if history.len()>500{&history[history.len()-500..]}else{history};
     let (r,p)=ui.allocate_painter(Vec2::new(ui.available_width(),125.0),egui::Sense::hover());let rect=r.rect.shrink(8.0);p.rect_filled(rect,egui::CornerRadius::same(5),Color32::from_rgb(13,20,35));
     if history.is_empty(){p.text(rect.center(),egui::Align2::CENTER_CENTER,"История появится после следующих снимков",egui::FontId::proportional(13.0),Color32::GRAY);return;}
     let max=history.iter().map(|x|x.delta_sales).max().unwrap_or(1).max(1) as f32;let left=rect.left()+15.0;let right=rect.right()-10.0;let top=rect.top()+10.0;let bottom=rect.bottom()-10.0;
@@ -1417,6 +1532,6 @@ pub fn run(out_dir:PathBuf)->Result<()>{
     let mut settings=load_settings(out_dir.clone());
     if explicit_out{settings.out_dir=out_dir;}
     let size=settings.window_size;
-    let options=eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([980.0,660.0]).with_icon(Arc::new(app_icon())),..Default::default()};
+    let options=eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([800.0,560.0]).with_maximized(true).with_icon(Arc::new(app_icon())),..Default::default()};
     eframe::run_native("Plati Radar",options,Box::new(move|cc|Ok(Box::new(PlatiApp::new(cc,settings))))).map_err(|e|anyhow::anyhow!("Не удалось запустить Plati Radar: {e}"))
 }
