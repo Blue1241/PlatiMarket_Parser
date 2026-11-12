@@ -2,7 +2,7 @@ use super::*;
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use futures::stream::{self, StreamExt};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Page { Deals, Seller, Sellers, Radar, Watchlist, Activity }
@@ -25,7 +25,22 @@ struct SavedSearch {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct TaskLogEntry { at: u64, task: String, status: String, details: String }
+struct TaskLogEntry { at: u64, task: String, status: String, details: String, #[serde(default = "default_one")] attempts: usize }
+
+#[derive(Clone)]
+struct ExportDraft { title:String, filename:String, rows:Vec<serde_json::Value>, columns:Vec<String>, selected:HashSet<String> }
+#[derive(Clone,Copy)]
+enum ExportFormat { Csv, Xlsx, Json }
+impl ExportFormat { fn extension(self)->&'static str {match self{Self::Csv=>"csv",Self::Xlsx=>"xlsx",Self::Json=>"json"}} }
+
+#[derive(Clone)]
+struct NoteEditor { item_id:Option<u64>, seller_id:Option<u64>, note:String, tags:String }
+
+fn default_one() -> usize { 1 }
+fn default_delay_ms() -> u64 { 250 }
+fn default_request_concurrency() -> usize { 4 }
+fn default_retention_days() -> u64 { 365 }
+fn default_history_limit() -> usize { 500 }
 
 #[derive(Clone, Default)]
 struct RadarAlertPrefs { enabled: bool, min_delta: i64, max_sellers: usize, text_filter: String, tracked_sellers_only: bool, seller_ids: Vec<u64> }
@@ -36,6 +51,8 @@ struct WatchObservation { at: u64, price: f64, sales: u64, reviews: u64 }
 #[derive(Clone, Serialize, Deserialize)]
 struct WatchedProduct {
     item_id: u64, title: String, url: String, seller_id: u64, seller_name: String,
+    #[serde(default)] note:String,
+    #[serde(default)] tags:Vec<String>,
     observations: Vec<WatchObservation>,
 }
 
@@ -44,7 +61,10 @@ struct SellerObservation { at: u64, rating: Option<f64>, sales: Option<u64>, rev
 
 #[derive(Clone, Serialize, Deserialize)]
 struct WatchedSeller {
-    seller_id: u64, name: String, url: String, observations: Vec<SellerObservation>,
+    seller_id: u64, name: String, url: String,
+    #[serde(default)] note:String,
+    #[serde(default)] tags:Vec<String>,
+    observations: Vec<SellerObservation>,
 }
 
 fn default_true() -> bool { true }
@@ -90,6 +110,14 @@ struct UiSettings {
     alert_filter: String,
     #[serde(default)]
     tracked_sellers_only: bool,
+    #[serde(default = "default_delay_ms")]
+    request_delay_ms:u64,
+    #[serde(default = "default_request_concurrency")]
+    request_concurrency:usize,
+    #[serde(default = "default_retention_days")]
+    retention_days:u64,
+    #[serde(default = "default_history_limit")]
+    history_limit:usize,
 }
 
 impl UiSettings {
@@ -102,7 +130,7 @@ impl UiSettings {
             min_delta: 1, max_sellers: 50, max_price: 1_000_000.0, max_markup: 1_000.0,
             radar_sort: RadarSort::Opportunity, favorites_only: false, notify_growth: true,
             price_alerts: true, sales_alerts: true, price_drop_threshold: 5.0, sales_growth_threshold: 1,
-            alert_filter: String::new(), tracked_sellers_only: false }
+            alert_filter: String::new(), tracked_sellers_only: false, request_delay_ms:250, request_concurrency:4, retention_days:365, history_limit:500 }
     }
 }
 
@@ -127,9 +155,9 @@ fn save_settings(settings: &UiSettings) {
 }
 
 enum UiMessage {
-    Deals(Result<Vec<ProductDeal>, String>),
-    Seller(Result<SellerRecord, String>),
-    Sellers(Result<Vec<SellerRecord>, String>),
+    Deals(Result<Vec<ProductDeal>, String>, usize),
+    Seller(Result<SellerRecord, String>, usize),
+    Sellers(Result<Vec<SellerRecord>, String>, usize),
     DiscoverProgress(usize, usize, String),
     Options(Result<(u64, String, f64, Vec<UiOptionGroup>), String>),
     NicheStarted,
@@ -208,6 +236,16 @@ struct PlatiApp {
     tracked_sellers_only: bool,
     restore_candidate: Option<PathBuf>,
     backup_message: String,
+    search_queue:VecDeque<SavedSearch>,
+    search_queue_running:bool,
+    queue_advance_pending:bool,
+    request_delay_ms:u64,
+    request_concurrency:usize,
+    retention_days:u64,
+    history_limit:usize,
+    watch_filter:String,
+    export_draft:Option<ExportDraft>,
+    note_editor:Option<NoteEditor>,
 }
 
 impl PlatiApp {
@@ -248,6 +286,9 @@ impl PlatiApp {
             activity_log: read_json_or(settings.out_dir.join("activity_log.json"), Vec::new()),
             price_alerts: settings.price_alerts, sales_alerts: settings.sales_alerts, price_drop_threshold: settings.price_drop_threshold, sales_growth_threshold: settings.sales_growth_threshold,
             alert_filter: settings.alert_filter.clone(), tracked_sellers_only: settings.tracked_sellers_only, restore_candidate: None, backup_message: String::new(),
+            search_queue:VecDeque::new(),search_queue_running:false,queue_advance_pending:false,
+            request_delay_ms:settings.request_delay_ms,request_concurrency:settings.request_concurrency,retention_days:settings.retention_days,history_limit:settings.history_limit,
+            watch_filter:String::new(),export_draft:None,note_editor:None,
         };
         app.start_radar_scheduler();
         app
@@ -290,11 +331,57 @@ impl PlatiApp {
         let (client, tx) = (self.client.clone(), self.tx.clone());
         let (query, keyword, exclude) = (self.query.trim().to_owned(), self.keyword.clone(), self.exclude.clone());
         let (pages, min_reviews, neg, inspect) = (self.pages, self.min_reviews, self.max_negative, self.inspect_limit);
+        let delay=self.request_delay_ms.clamp(50,5000);
+        let concurrency=self.request_concurrency.clamp(1,12);
         let task = self.runtime.spawn(async move {
-            let result = search_deals(&client, &query, pages, min_reviews, neg, &keyword, &exclude, inspect, SortMode::RealPrice, 6, 80).await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMessage::Deals(result));
+            let mut attempts=0usize;
+            let result=loop {
+                attempts+=1;
+                match search_deals(&client,&query,pages,min_reviews,neg,&keyword,&exclude,inspect,SortMode::RealPrice,concurrency,delay).await {
+                    Ok(items)=>break Ok(items),
+                    Err(_error) if attempts<3=>{tokio::time::sleep(Duration::from_millis(delay.saturating_mul(attempts as u64))).await;continue;},
+                    Err(error)=>break Err(error.to_string()),
+                }
+            };
+            let _=tx.send(UiMessage::Deals(result,attempts));
         });
         self.search_cancel = Some(task.abort_handle());
+    }
+
+    fn enqueue_search(&mut self,index:usize) {
+        if let Some(preset)=self.saved_searches.get(index).cloned(){
+            self.search_queue.push_back(preset);
+            self.message=format!("Поиск добавлен в очередь · {} в очереди",self.search_queue.len());
+        }
+    }
+
+    fn start_search_queue(&mut self) {
+        if self.search_queue_running { return; }
+        if self.search_queue.is_empty(){self.message="Очередь поисков пуста".into();return;}
+        self.search_queue_running=true;
+        self.record_task("Очередь поисков","Запущено",format!("{} задач",self.search_queue.len()));
+        self.run_next_queued_search();
+    }
+
+    fn run_next_queued_search(&mut self) {
+        if self.search_busy { return; }
+        while let Some(preset)=self.search_queue.pop_front(){
+            if preset.query.trim().chars().count()<3 {self.record_task("Очередь поисков","Пропущено",format!("{}: запрос короче 3 символов",preset.name));continue;}
+            self.query=preset.query;self.keyword=preset.keyword;self.exclude=preset.exclude;
+            self.min_reviews=preset.min_reviews;self.max_negative=preset.max_negative;self.pages=preset.pages;self.inspect_limit=preset.inspect_limit;self.sort=preset.sort;
+            self.message=format!("Очередь: поиск «{}» · осталось {}",preset.name,self.search_queue.len());
+            self.send_search();return;
+        }
+        self.search_queue_running=false;
+        self.record_task("Очередь поисков","Завершено","Все поиски обработаны".into());
+        self.message="Очередь поисков завершена".into();
+    }
+
+    fn stop_search_queue(&mut self) {
+        self.search_queue.clear();self.search_queue_running=false;self.queue_advance_pending=false;
+        if self.search_busy { self.cancel_search(); }
+        self.message="Очередь поисков остановлена".into();
+        self.record_task("Очередь поисков","Отменено",String::new());
     }
 
     fn cancel_search(&mut self) {
@@ -302,6 +389,7 @@ impl PlatiApp {
         self.search_busy = false;
         self.message = "Поиск отменён".into();
         self.record_task("Поиск предложений","Отменено",self.query.clone());
+        if self.search_queue_running {self.search_queue.clear();self.search_queue_running=false;self.record_task("Очередь поисков","Отменено","Текущий поиск отменён".into());}
     }
 
     fn save_search_preset(&mut self) {
@@ -323,13 +411,15 @@ impl PlatiApp {
         }
     }
 
-    fn record_task(&mut self, task:&str, status:&str, details:String) {
+    fn record_task(&mut self, task:&str, status:&str, details:String) { self.record_task_attempts(task,status,details,1); }
+
+    fn record_task_attempts(&mut self, task:&str, status:&str, details:String, attempts:usize) {
         let now=unix_now();
         let details=if status!="Запущено" {
             self.activity_log.iter().find(|e|e.task==task&&e.status=="Запущено").map(|start|format!("{details} · длительность {} сек",now.saturating_sub(start.at))).unwrap_or(details)
         } else { details };
-        self.activity_log.insert(0,TaskLogEntry{at:now,task:task.into(),status:status.into(),details});
-        self.activity_log.truncate(300);
+        self.activity_log.insert(0,TaskLogEntry{at:now,task:task.into(),status:status.into(),details,attempts});
+        self.activity_log.truncate(self.history_limit.clamp(50,5000));
         let _=write_json_atomic(&self.out_dir.join("activity_log.json"),&self.activity_log);
     }
 
@@ -342,7 +432,7 @@ impl PlatiApp {
         if self.watchlist.iter().any(|w|w.item_id==d.item_id) {
             self.watchlist.retain(|w|w.item_id!=d.item_id);self.persist_watchlist();self.message=format!("Отслеживание остановлено: {}",d.title);return;
         }
-        self.watchlist.push(WatchedProduct{item_id:d.item_id,title:d.title.clone(),url:d.item_url.clone(),seller_id:d.seller_id,seller_name:d.seller_name.clone(),observations:vec![WatchObservation{at:unix_now(),price:d.real_tariff_price_rub,sales:d.sold_count,reviews:d.positive_reviews+d.negative_reviews}]});
+        self.watchlist.push(WatchedProduct{item_id:d.item_id,title:d.title.clone(),url:d.item_url.clone(),seller_id:d.seller_id,seller_name:d.seller_name.clone(),note:String::new(),tags:Vec::new(),observations:vec![WatchObservation{at:unix_now(),price:d.real_tariff_price_rub,sales:d.sold_count,reviews:d.positive_reviews+d.negative_reviews}]});
         self.persist_watchlist(); self.message=format!("Добавлено в отслеживание: {}",d.title);
     }
 
@@ -350,7 +440,7 @@ impl PlatiApp {
         if self.watched_sellers.iter().any(|w|w.seller_id==seller.seller_id) {
             self.watched_sellers.retain(|w|w.seller_id!=seller.seller_id);self.persist_watchlist();self.message=format!("Отслеживание продавца {} остановлено",seller.seller_name);return;
         }
-        self.watched_sellers.push(WatchedSeller{seller_id:seller.seller_id,name:seller.seller_name.clone(),url:seller.profile_url.clone(),observations:vec![SellerObservation{at:unix_now(),rating:seller.rating,sales:seller.sales_count,reviews:seller.reviews_count,returns:seller.returns_count}]});
+        self.watched_sellers.push(WatchedSeller{seller_id:seller.seller_id,name:seller.seller_name.clone(),url:seller.profile_url.clone(),note:String::new(),tags:Vec::new(),observations:vec![SellerObservation{at:unix_now(),rating:seller.rating,sales:seller.sales_count,reviews:seller.reviews_count,returns:seller.returns_count}]});
         self.persist_watchlist(); self.message=format!("Продавец {} добавлен в отслеживание",seller.seller_name);
     }
 
@@ -368,7 +458,7 @@ impl PlatiApp {
                 }
                 w.title=d.title.clone(); w.seller_name=d.seller_name.clone();
                 w.observations.push(WatchObservation{at:unix_now(),price:d.real_tariff_price_rub,sales:d.sold_count,reviews:d.positive_reviews+d.negative_reviews});
-                if w.observations.len()>500 { w.observations.drain(..w.observations.len()-500); }
+                if w.observations.len()>self.history_limit.clamp(50,5000) {let extra=w.observations.len()-self.history_limit.clamp(50,5000);w.observations.drain(..extra);}
             }
         }
         if !deals.is_empty() { self.persist_watchlist(); }
@@ -384,7 +474,7 @@ impl PlatiApp {
         if let Some(w)=self.watched_sellers.iter_mut().find(|w|w.seller_id==seller.seller_id) {
             w.name=seller.seller_name.clone();
             w.observations.push(SellerObservation{at:unix_now(),rating:seller.rating,sales:seller.sales_count,reviews:seller.reviews_count,returns:seller.returns_count});
-            if w.observations.len()>500 { w.observations.drain(..w.observations.len()-500); }
+            if w.observations.len()>self.history_limit.clamp(50,5000) {let extra=w.observations.len()-self.history_limit.clamp(50,5000);w.observations.drain(..extra);}
             updated=true;
         }
         if updated { self.persist_watchlist(); }
@@ -439,6 +529,40 @@ impl PlatiApp {
         }
     }
 
+    fn apply_retention(&mut self) {
+        let cutoff=unix_now().saturating_sub(self.retention_days.clamp(30,3650).saturating_mul(86_400));
+        let limit=self.history_limit.clamp(50,5000);
+        for watched in &mut self.watchlist {
+            watched.observations.retain(|item|item.at>=cutoff);
+            if watched.observations.len()>limit {let drop=watched.observations.len()-limit;watched.observations.drain(..drop);}
+        }
+        for watched in &mut self.watched_sellers {
+            watched.observations.retain(|item|item.at>=cutoff);
+            if watched.observations.len()>limit {let drop=watched.observations.len()-limit;watched.observations.drain(..drop);}
+        }
+        self.activity_log.retain(|entry|entry.at>=cutoff);
+        self.activity_log.truncate(limit);
+        let mut archived=0usize;
+        let snapshots_dir=self.out_dir.join("niche_snapshots");
+        let archive_dir=self.out_dir.join("archive").join("niche_snapshots");
+        if let Ok(entries)=fs::read_dir(&snapshots_dir) {
+            for entry in entries.flatten() {
+                let path=entry.path();if path.extension().and_then(|e|e.to_str())!=Some("json"){continue;}
+                let old=fs::read(&path).ok().and_then(|raw|serde_json::from_slice::<NicheSnapshot>(&raw).ok()).map(|s|s.captured_at<cutoff).unwrap_or(false);
+                if old {
+                    if fs::create_dir_all(&archive_dir).is_ok(){let destination=archive_dir.join(entry.file_name());if fs::rename(&path,destination).is_ok(){archived+=1;}}
+                }
+            }
+        }
+        let history_path=self.out_dir.join("niche_history.json");
+        if let Ok(raw)=fs::read(&history_path){if let Ok(mut points)=serde_json::from_slice::<Vec<NicheHistoryPoint>>(&raw){points.retain(|p|p.captured_at>=cutoff);let _=write_json_atomic(&history_path,&points);}}
+        self.persist_watchlist();
+        let _=write_json_atomic(&self.out_dir.join("activity_log.json"),&self.activity_log);
+        self.reload_radar();
+        self.record_task("Очистка истории","Завершено",format!("архивировано снимков радара: {archived}; срок хранения: {} дн.; лимит записей: {}",self.retention_days,limit));
+        self.message=format!("Очистка завершена · архивировано снимков: {archived}");
+    }
+
     fn send_seller_lookup(&mut self) {
         if self.seller_busy || self.seller_url.trim().is_empty() { return; }
         self.seller_busy = true;
@@ -446,8 +570,8 @@ impl PlatiApp {
         let (client, tx, url) = (self.client.clone(), self.tx.clone(), self.seller_url.trim().to_owned());
         let task = self.runtime.spawn(async move {
             let id = extract_seller_id_from_url(&url);
-            let result = fetch_seller_profile(&client, &url, id).await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMessage::Seller(result));
+            let (result,attempts) = fetch_seller_profile_with_attempts(&client, &url, id).await;
+            let _ = tx.send(UiMessage::Seller(result.map_err(|e| e.to_string()),attempts));
         });
         self.seller_cancel = Some(task.abort_handle());
     }
@@ -489,14 +613,19 @@ impl PlatiApp {
         self.discover_progress = (0, 0, "Получаем список категорий…".into());
         let (client, tx) = (self.client.clone(), self.tx.clone());
         let (max_cats, enrich) = (self.max_categories.clamp(1, 389), self.enrich_limit.min(100));
+        let delay_ms=self.request_delay_ms.clamp(50,5000);
+        let concurrency=self.request_concurrency.clamp(1,12);
         let task = self.runtime.spawn(async move {
-            let result = async {
+            let mut attempts=0usize;
+            let result=loop {
+                attempts+=1;
+                let attempt_result = async {
                 let queries = fetch_category_queries(&client, max_cats).await?;
                 let total = queries.len();
                 let mut map = BTreeMap::new();
                 for (index, query) in queries.into_iter().enumerate() {
                     let one_query = vec![query.clone()];
-                    let found = discover_sellers_via_api(&client, &one_query, 1, 150).await?;
+                    let found = discover_sellers_via_api(&client, &one_query, 1, delay_ms).await?;
                     map.extend(found);
                     let _ = tx.send(UiMessage::DiscoverProgress(index + 1, total, query));
                 }
@@ -508,17 +637,24 @@ impl PlatiApp {
                     let extra: Vec<SellerRecord> = stream::iter(ids).map(|id| {
                         let client = client.clone();
                         async move {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             fetch_seller_profile(&client, &format!("https://plati.market/seller/s/{id}/"), Some(id)).await.ok()
                         }
-                    }).buffer_unordered(4).filter_map(|x| async move { x }).collect().await;
+                    }).buffer_unordered(concurrency).filter_map(|x| async move { x }).collect().await;
                     for seller in extra { map.insert(seller.seller_id, seller); }
                 }
                 let mut result: Vec<SellerRecord> = map.into_values().collect();
                 result.sort_by(|a,b| b.rating.unwrap_or(0.0).partial_cmp(&a.rating.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
                 Ok::<_, anyhow::Error>(result)
-            }.await.map_err(|e| e.to_string());
-            let _ = tx.send(UiMessage::Sellers(result));
+                }.await;
+                match attempt_result {
+                    Ok(records)=>break Ok(records),
+                    Err(_error) if attempts<3=>{tokio::time::sleep(Duration::from_millis(delay_ms.saturating_mul(attempts as u64))).await;continue;},
+                    Err(error)=>break Err(error),
+                }
+            };
+            let result=result.map_err(|e:anyhow::Error|e.to_string());
+            let _ = tx.send(UiMessage::Sellers(result,attempts));
         });
         self.discover_cancel = Some(task.abort_handle());
     }
@@ -539,9 +675,10 @@ impl PlatiApp {
     fn poll(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
-                UiMessage::Deals(result) => {
+                UiMessage::Deals(result,attempts) => {
                     self.search_busy = false;
                     self.search_cancel = None;
+                    self.queue_advance_pending=true;
                     match result {
                         Ok(items) => {
                             self.message = match save_deals_files(&self.out_dir, &items) {
@@ -549,30 +686,30 @@ impl PlatiApp {
                                 Err(e) => format!("Найдено {}, ошибка записи: {e}", items.len()),
                             };
                             self.observe_watched_products(&items);
-                            self.record_task("Поиск предложений","Завершено",format!("найдено {} карточек",items.len()));
+                            self.record_task_attempts("Поиск предложений","Завершено",format!("найдено {} карточек",items.len()),attempts);
                             self.deals = items;
                         }
-                        Err(e) => { self.record_task("Поиск предложений","Ошибка",e.clone()); self.message = format!("Ошибка поиска: {e}"); },
+                        Err(e) => { self.record_task_attempts("Поиск предложений","Ошибка",e.clone(),attempts); self.message = format!("Ошибка поиска: {e}"); },
                     }
                 }
-                UiMessage::Seller(result) => {
+                UiMessage::Seller(result,attempts) => {
                     self.seller_busy = false;
                     self.seller_cancel = None;
                     match result {
                         Ok(item) => {
                             let _ = save_sellers_outputs(&self.out_dir, std::slice::from_ref(&item));
                             self.observe_watched_seller(&item);
-                            self.record_task("Проверка продавца","Завершено",item.seller_name.clone());
+                            self.record_task_attempts("Проверка продавца","Завершено",item.seller_name.clone(),attempts);
                             self.seller = Some(item);
                             self.message = "Профиль продавца загружен".into();
                         }
-                        Err(e) => { self.record_task("Проверка продавца","Ошибка",e.clone()); self.message = format!("Ошибка загрузки профиля: {e}"); },
+                        Err(e) => { self.record_task_attempts("Проверка продавца","Ошибка",e.clone(),attempts); self.message = format!("Ошибка загрузки профиля: {e}"); },
                     }
                 }
                 UiMessage::DiscoverProgress(done, total, category) => {
                     self.discover_progress = (done, total, category);
                 }
-                UiMessage::Sellers(result) => {
+                UiMessage::Sellers(result,attempts) => {
                     self.discover_busy = false;
                     self.discover_cancel = None;
                     match result {
@@ -582,10 +719,10 @@ impl PlatiApp {
                                 Err(e) => format!("Найдено {}, ошибка записи: {e}", items.len()),
                             };
                             for seller in &items { self.observe_watched_seller(seller); }
-                            self.record_task("Сбор продавцов","Завершено",format!("найдено {} продавцов",items.len()));
+                            self.record_task_attempts("Сбор продавцов","Завершено",format!("найдено {} продавцов",items.len()),attempts);
                             self.sellers = items;
                         }
-                        Err(e) => { self.record_task("Сбор продавцов","Ошибка",e.clone()); self.message = format!("Ошибка сбора продавцов: {e}"); },
+                        Err(e) => { self.record_task_attempts("Сбор продавцов","Ошибка",e.clone(),attempts); self.message = format!("Ошибка сбора продавцов: {e}"); },
                     }
                 }
                 UiMessage::Options(result) => {
@@ -617,6 +754,7 @@ impl PlatiApp {
                 }
             }
         }
+        if self.queue_advance_pending { self.queue_advance_pending=false; if self.search_queue_running {self.run_next_queued_search();} }
         self.progress = read_niche_progress(&self.out_dir);
     }
 
@@ -665,6 +803,10 @@ impl PlatiApp {
         self.settings.sales_growth_threshold = self.sales_growth_threshold;
         self.settings.alert_filter = self.alert_filter.clone();
         self.settings.tracked_sellers_only = self.tracked_sellers_only;
+        self.settings.request_delay_ms=self.request_delay_ms;
+        self.settings.request_concurrency=self.request_concurrency;
+        self.settings.retention_days=self.retention_days;
+        self.settings.history_limit=self.history_limit;
         let alert_prefs=self.radar_alert_prefs();
         if let Ok(mut prefs) = self.radar_prefs_shared.write() { *prefs = alert_prefs; }
         if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| [r.width(), r.height()])) {
@@ -698,24 +840,61 @@ impl PlatiApp {
         self.message = result.map(|_| format!("Открыта папка {}", self.out_dir.display())).unwrap_or_else(|e| format!("Не удалось открыть папку: {e}"));
     }
 
-    fn export_deals_as(&mut self, csv: bool) {
-        let (name, filter, ext) = if csv { ("deals.csv", "CSV", "csv") } else { ("deals.json", "JSON", "json") };
-        if let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter(filter, &[ext]).save_file() {
-            self.message = export_records(&path, &self.deals).map(|_| format!("Экспортировано: {}", path.display())).unwrap_or_else(|e| format!("Ошибка экспорта: {e}"));
+    fn prepare_export_values(&mut self,title:&str,filename:&str,rows:Vec<serde_json::Value>) {
+        let Some(serde_json::Value::Object(first))=rows.first() else {self.message="Экспорт невозможен: таблица пуста".into();return;};
+        let columns:Vec<String>=first.keys().cloned().collect();
+        let selected=columns.iter().cloned().collect();
+        self.export_draft=Some(ExportDraft{title:title.into(),filename:filename.into(),rows,columns,selected});
+    }
+
+    fn prepare_export<T:Serialize>(&mut self,title:&str,filename:&str,records:&[T]) {
+        match records.iter().map(serde_json::to_value).collect::<std::result::Result<Vec<_>,_>>() {
+            Ok(rows)=>self.prepare_export_values(title,filename,rows),
+            Err(error)=>self.message=format!("Не удалось подготовить экспорт: {error}"),
         }
     }
 
-    fn export_sellers_as(&mut self, csv: bool) {
-        let (name, filter, ext) = if csv { ("plati_sellers.csv", "CSV", "csv") } else { ("plati_sellers.json", "JSON", "json") };
-        if let Some(path) = rfd::FileDialog::new().set_file_name(name).add_filter(filter, &[ext]).save_file() {
-            self.message = export_records(&path, &self.sellers).map(|_| format!("Экспортировано: {}", path.display())).unwrap_or_else(|e| format!("Ошибка экспорта: {e}"));
+    fn export_dialog(&mut self,ctx:&egui::Context) {
+        let Some(mut draft)=self.export_draft.take() else{return};let mut open=true;let mut action=None;let mut move_up=None;let mut move_down=None;
+        egui::Window::new(format!("Экспорт · {}",draft.title)).open(&mut open).resizable(true).default_width(760.0).show(ctx,|ui|{
+            ui.label(format!("{} строк · выберите столбцы и порядок; предпросмотр показывает первые 5 строк",draft.rows.len()));
+            ui.separator();
+            ui.columns(2,|columns|{
+                columns[0].label(RichText::new("Столбцы (↑ / ↓ меняют порядок)").strong());
+                egui::ScrollArea::vertical().max_height(220.0).show(&mut columns[0],|ui|{
+                    for (i,key) in draft.columns.clone().iter().enumerate(){
+                        ui.horizontal(|ui|{let mut selected=draft.selected.contains(key);if ui.checkbox(&mut selected,key).changed(){if selected{draft.selected.insert(key.clone());}else{draft.selected.remove(key);}}
+                            if ui.small_button("↑").clicked()&&i>0{move_up=Some(i);}
+                            if ui.small_button("↓").clicked()&&i+1<draft.columns.len(){move_down=Some(i);}
+                        });
+                    }
+                });
+                columns[1].label(RichText::new("Предпросмотр").strong());
+                let active:Vec<&String>=draft.columns.iter().filter(|c|draft.selected.contains(*c)).collect();
+                egui::ScrollArea::both().max_height(220.0).show(&mut columns[1],|ui|{
+                    egui::Grid::new("export_preview_grid").striped(true).show(ui,|ui|{for key in &active{ui.label(RichText::new(key.as_str()).strong());}ui.end_row();for row in draft.rows.iter().take(5){for key in &active{ui.label(export_cell(row.get(*key).unwrap_or(&serde_json::Value::Null)));}ui.end_row();}});
+                });
+            });
+            if let Some(i)=move_up{draft.columns.swap(i,i-1);}if let Some(i)=move_down{draft.columns.swap(i,i+1);}
+            ui.separator();
+            ui.horizontal(|ui|{
+                let enabled=!draft.selected.is_empty();
+                if ui.add_enabled(enabled,egui::Button::new("Экспорт CSV…")).clicked(){action=Some(ExportFormat::Csv);}
+                if ui.add_enabled(enabled,egui::Button::new("Экспорт XLSX…")).clicked(){action=Some(ExportFormat::Xlsx);}
+                if ui.add_enabled(enabled,egui::Button::new("Экспорт JSON…")).clicked(){action=Some(ExportFormat::Json);}
+                if !enabled{ui.colored_label(Color32::LIGHT_RED,"Выберите хотя бы один столбец");}
+            });
+        });
+        if let Some(format)=action {
+            let columns:Vec<String>=draft.columns.iter().filter(|c|draft.selected.contains(*c)).cloned().collect();
+            let filename=format!("{}.{}",draft.filename,format.extension());
+            let filter=match format{ExportFormat::Csv=>"CSV",ExportFormat::Xlsx=>"Excel",ExportFormat::Json=>"JSON"};
+            if let Some(path)=rfd::FileDialog::new().set_file_name(&filename).add_filter(filter,&[format.extension()]).save_file(){
+                self.message=write_custom_export(&path,&columns,&draft.rows,format).map(|_|format!("Экспортировано: {}",path.display())).unwrap_or_else(|e|format!("Ошибка экспорта: {e}"));
+                return;
+            }
         }
-    }
-
-    fn export_radar_as(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().set_file_name("niche_radar.csv").add_filter("CSV", &["csv"]).save_file() {
-            self.message = write_niche_csv(&path, &self.snapshots).map(|_| format!("Экспортировано: {}", path.display())).unwrap_or_else(|e| format!("Ошибка экспорта: {e}"));
-        }
+        if open {self.export_draft=Some(draft);}
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -784,6 +963,15 @@ impl PlatiApp {
                 });
                 if let Some(i)=chosen_search{self.apply_saved_search(i);}
                 if ui.button("Удалить фильтр").clicked() && self.selected_saved_search<self.saved_searches.len(){self.saved_searches.remove(self.selected_saved_search);self.selected_saved_search=self.selected_saved_search.min(self.saved_searches.len().saturating_sub(1));let _=write_json_atomic(&self.out_dir.join("saved_searches.json"),&self.saved_searches);}
+                if ui.button("В очередь").clicked(){self.enqueue_search(self.selected_saved_search);}
+                if !self.search_queue_running {
+                    if ui.button(format!("Запустить очередь ({})",self.search_queue.len())).clicked(){self.start_search_queue();}
+                } else if ui.button(format!("Остановить очередь ({})",self.search_queue.len())).clicked(){self.stop_search_queue();}
+            });
+            ui.horizontal_wrapped(|ui|{
+                ui.label("Пауза API, мс");ui.add(egui::DragValue::new(&mut self.request_delay_ms).range(50..=5000));
+                ui.label("Параллельность");ui.add(egui::DragValue::new(&mut self.request_concurrency).range(1..=12));
+                if !self.search_queue.is_empty() && ui.small_button("Очистить очередь").clicked(){self.search_queue.clear();self.search_queue_running=false;}
             });
             egui::CollapsingHeader::new("Фильтры и параметры").default_open(true).show(ui, |ui| {
                 egui::Grid::new("search_config").num_columns(4).spacing([12.0,8.0]).show(ui, |ui| {
@@ -804,9 +992,7 @@ impl PlatiApp {
             ui.label(RichText::new(format!("{} карточек",self.deals.len())).color(Color32::GRAY));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
                 ui.add(egui::TextEdit::singleline(&mut self.deals_filter).desired_width(200.0).hint_text("Фильтр названия / продавца"));
-                if ui.button("CSV…").clicked() { self.export_deals_as(true); }
-                if ui.button("JSON…").clicked() { self.export_deals_as(false); }
-                if ui.button("Excel…").clicked() { if let Some(path)=rfd::FileDialog::new().set_file_name("deals.xlsx").add_filter("Excel","xlsx").save_file(){self.message=export_xlsx_records(&path,&self.deals).map(|_|format!("Экспортировано: {}",path.display())).unwrap_or_else(|e|format!("Ошибка Excel-экспорта: {e}"));} }
+                if ui.button("Экспорт / настроить…").clicked(){let f=self.deals_filter.to_lowercase();let rows:Vec<ProductDeal>=self.deals.iter().filter(|d|f.is_empty()||d.title.to_lowercase().contains(&f)||d.seller_name.to_lowercase().contains(&f)).cloned().collect();self.prepare_export("Предложения","deals",&rows);}
             });
         });
         card(ui,|ui|{
@@ -888,7 +1074,7 @@ impl PlatiApp {
             ui.horizontal(|ui|{ui.vertical(|ui|{ui.label("Макс. категорий");ui.add(egui::DragValue::new(&mut self.max_categories).range(1..=389));});ui.vertical(|ui|{ui.label("Профилей обогатить");ui.add(egui::DragValue::new(&mut self.enrich_limit).range(0..=100));});if self.discover_busy{if ui.button("Отменить сбор").clicked(){self.cancel_discover();}}else if ui.add(egui::Button::new("Начать сбор").fill(Color32::from_rgb(2,132,199))).clicked(){self.send_discover();}});
             if self.discover_busy { if self.discover_progress.1>0 { let f=self.discover_progress.0 as f32/self.discover_progress.1 as f32;ui.add(egui::ProgressBar::new(f).show_percentage().text(format!("{} / {} категорий",self.discover_progress.0,self.discover_progress.1))); } ui.label(&self.discover_progress.2); }
         }); self.message(ui);
-        ui.horizontal(|ui|{ui.heading("Продавцы");ui.label(RichText::new(format!("{} записей",self.sellers.len())).color(Color32::GRAY));ui.add(egui::TextEdit::singleline(&mut self.sellers_filter).desired_width(180.0).hint_text("Фильтр"));if ui.button("CSV…").clicked(){self.export_sellers_as(true);}if ui.button("JSON…").clicked(){self.export_sellers_as(false);}if ui.button("Excel…").clicked(){if let Some(path)=rfd::FileDialog::new().set_file_name("sellers.xlsx").add_filter("Excel","xlsx").save_file(){self.message=export_xlsx_records(&path,&self.sellers).map(|_|format!("Экспортировано: {}",path.display())).unwrap_or_else(|e|format!("Ошибка Excel-экспорта: {e}"));}}});
+        ui.horizontal(|ui|{ui.heading("Продавцы");ui.label(RichText::new(format!("{} записей",self.sellers.len())).color(Color32::GRAY));ui.add(egui::TextEdit::singleline(&mut self.sellers_filter).desired_width(180.0).hint_text("Фильтр"));if ui.button("Экспорт / настроить…").clicked(){let f=self.sellers_filter.to_lowercase();let rows:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();self.prepare_export("Продавцы","sellers",&rows);}});
         card(ui,|ui|{egui::ScrollArea::both().max_height(590.0).show(ui,|ui|{
             egui::Grid::new("seller_list").striped(true).spacing([16.0,7.0]).show(ui,|ui|{
                 ui.label(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252)));
@@ -932,8 +1118,7 @@ impl PlatiApp {
             egui::ComboBox::from_id_salt("radar_sort").selected_text(radar_sort_name(self.radar_sort)).show_ui(ui,|ui|{for s in [RadarSort::Opportunity,RadarSort::Delta,RadarSort::Price,RadarSort::Sellers]{ui.selectable_value(&mut self.radar_sort,s,radar_sort_name(s));}});
             ui.checkbox(&mut self.favorites_only,"Избранное");
             ui.checkbox(&mut self.notify_growth,"Оповещать о совпадениях");
-            if ui.button("Сохранить CSV…").clicked(){self.export_radar_as();}
-            if ui.button("Excel…").clicked(){let rows=build_niche_trends(&self.snapshots);if let Some(path)=rfd::FileDialog::new().set_file_name("niche_radar.xlsx").add_filter("Excel","xlsx").save_file(){self.message=export_xlsx_records(&path,&rows).map(|_|format!("Экспортировано: {}",path.display())).unwrap_or_else(|e|format!("Ошибка Excel-экспорта: {e}"));}}
+            if ui.button("Экспорт / настроить…").clicked(){let rows=build_niche_trends(&self.snapshots);self.prepare_export("Радар ниш","niche_radar",&rows);}
         });
         card(ui,|ui|{
             let mut trends=build_niche_trends(&self.snapshots);
@@ -966,13 +1151,15 @@ impl PlatiApp {
             ui.horizontal_wrapped(|ui|{ui.label("Текст / категории (через запятую)");ui.add(egui::TextEdit::singleline(&mut self.alert_filter).desired_width(310.0).hint_text("ключевые слова или названия категорий"));ui.checkbox(&mut self.tracked_sellers_only,"Только выбранные продавцы");});
             ui.label(RichText::new("Карточки обновляются при следующих поисках, продавцы — при повторной проверке их профиля. Данные и история хранятся локально.").small().color(Color32::GRAY));
         });
-        ui.heading(format!("Карточки · {}",self.watchlist.len()));
-        let mut remove_products=Vec::new();
+        ui.horizontal(|ui|{ui.heading(format!("Карточки · {}",self.watchlist.len()));ui.add(egui::TextEdit::singleline(&mut self.watch_filter).desired_width(210.0).hint_text("Фильтр по метке, заметке, товару"));});
+        let filter=self.watch_filter.trim().to_lowercase();let mut remove_products=Vec::new();let mut edit_request=None;
         egui::ScrollArea::vertical().max_height(330.0).show(ui,|ui|{
             for w in &self.watchlist {
+                let searchable=format!("{} {} {} {}",w.title,w.seller_name,w.note,w.tags.join(" ")).to_lowercase();
+                if !filter.is_empty()&&!searchable.contains(&filter){continue;}
                 let latest=w.observations.last();let previous=w.observations.iter().rev().nth(1);
                 card(ui,|ui|{
-                    ui.horizontal(|ui|{ui.vertical(|ui|{ui.hyperlink_to(&w.title,&w.url);ui.label(RichText::new(format!("{} · ID {} · {} наблюдений",w.seller_name,w.item_id,w.observations.len())).small().color(Color32::GRAY));});ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|if ui.small_button("Убрать").clicked(){remove_products.push(w.item_id);});});
+                    ui.horizontal(|ui|{ui.vertical(|ui|{ui.hyperlink_to(&w.title,&w.url);ui.label(RichText::new(format!("{} · ID {} · {} наблюдений",w.seller_name,w.item_id,w.observations.len())).small().color(Color32::GRAY));if !w.tags.is_empty(){ui.label(RichText::new(w.tags.join(" · ")).small().color(Color32::from_rgb(125,211,252)));}if !w.note.is_empty(){ui.label(RichText::new(&w.note).small().color(Color32::GRAY));}});ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.small_button("Убрать").clicked(){remove_products.push(w.item_id);}if ui.small_button("Заметка / метки").clicked(){edit_request=Some(NoteEditor{item_id:Some(w.item_id),seller_id:None,note:w.note.clone(),tags:w.tags.join(", ")});}});});
                     if let Some(now)=latest {let delta=previous.map(|p|now.price-p.price).unwrap_or(0.0);let sales=previous.map(|p|now.sales as i64-p.sales as i64).unwrap_or(0);ui.label(format!("Цена {:.0} ₽ ({:+.0} ₽) · Продажи {} ({:+}) · отзывы {} · проверено {}",now.price,delta,now.sales,sales,now.reviews,date(now.at)));}
                 });
             }
@@ -981,9 +1168,29 @@ impl PlatiApp {
         ui.heading(format!("Продавцы · {}",self.watched_sellers.len()));
         let mut remove_sellers=Vec::new();
         egui::ScrollArea::vertical().max_height(300.0).show(ui,|ui|{
-            for w in &self.watched_sellers {let latest=w.observations.last();let previous=w.observations.iter().rev().nth(1);card(ui,|ui|{ui.horizontal(|ui|{ui.vertical(|ui|{ui.hyperlink_to(format!("{} · #{}",w.name,w.seller_id),&w.url);ui.label(RichText::new(format!("{} наблюдений",w.observations.len())).small().color(Color32::GRAY));});ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|if ui.small_button("Убрать").clicked(){remove_sellers.push(w.seller_id);});});if let Some(n)=latest{let sales_delta=match(n.sales,previous.and_then(|p|p.sales)){(Some(a),Some(b))=>format!("{:+}",a as i64-b as i64),_=>"—".into()};ui.label(format!("Рейтинг {:.1} · Продажи {} ({}) · Отзывы {} · Возвраты {} · {}",n.rating.unwrap_or(0.0),opt(n.sales),sales_delta,opt(n.reviews),opt(n.returns),date(n.at)));}});}
+            for w in &self.watched_sellers {
+                let searchable=format!("{} {} {} {}",w.name,w.note,w.tags.join(" "),w.seller_id).to_lowercase();if !filter.is_empty()&&!searchable.contains(&filter){continue;}
+                let latest=w.observations.last();let previous=w.observations.iter().rev().nth(1);
+                card(ui,|ui|{ui.horizontal(|ui|{ui.vertical(|ui|{ui.hyperlink_to(format!("{} · #{}",w.name,w.seller_id),&w.url);ui.label(RichText::new(format!("{} наблюдений",w.observations.len())).small().color(Color32::GRAY));if !w.tags.is_empty(){ui.label(RichText::new(w.tags.join(" · ")).small().color(Color32::from_rgb(125,211,252)));}if !w.note.is_empty(){ui.label(RichText::new(&w.note).small().color(Color32::GRAY));}});ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.small_button("Убрать").clicked(){remove_sellers.push(w.seller_id);}if ui.small_button("Заметка / метки").clicked(){edit_request=Some(NoteEditor{item_id:None,seller_id:Some(w.seller_id),note:w.note.clone(),tags:w.tags.join(", ")});}});});if let Some(n)=latest{let sales_delta=match(n.sales,previous.and_then(|p|p.sales)){(Some(a),Some(b))=>format!("{:+}",a as i64-b as i64),_=>"—".into()};ui.label(format!("Рейтинг {:.1} · Продажи {} ({}) · Отзывы {} · Возвраты {} · {}",n.rating.unwrap_or(0.0),opt(n.sales),sales_delta,opt(n.reviews),opt(n.returns),date(n.at)));}});
+            }
         });
         if !remove_sellers.is_empty(){self.watched_sellers.retain(|w|!remove_sellers.contains(&w.seller_id));self.persist_watchlist();}
+        if let Some(editor)=edit_request{self.note_editor=Some(editor);}
+    }
+
+    fn note_dialog(&mut self,ctx:&egui::Context) {
+        let Some(mut editor)=self.note_editor.take() else{return};let mut open=true;let mut save=false;
+        egui::Window::new("Заметка и метки").open(&mut open).show(ctx,|ui|{
+            ui.label("Заметка");ui.add(egui::TextEdit::multiline(&mut editor.note).desired_rows(4).desired_width(420.0));
+            ui.label("Метки через запятую");ui.text_edit_singleline(&mut editor.tags);
+            if ui.button("Сохранить").clicked(){save=true;}
+        });
+        if save {
+            let tags:Vec<String>=editor.tags.split(',').map(str::trim).filter(|t|!t.is_empty()).map(str::to_owned).collect();
+            if let Some(id)=editor.item_id {if let Some(w)=self.watchlist.iter_mut().find(|w|w.item_id==id){w.note=editor.note.clone();w.tags=tags.clone();}}
+            if let Some(id)=editor.seller_id {if let Some(w)=self.watched_sellers.iter_mut().find(|w|w.seller_id==id){w.note=editor.note.clone();w.tags=tags.clone();}}
+            self.persist_watchlist();
+        } else if open {self.note_editor=Some(editor);}
     }
 
     fn snapshot_comparison(&self,ui:&mut egui::Ui) {
@@ -1004,6 +1211,8 @@ impl PlatiApp {
     fn activity_view(&mut self,ui:&mut egui::Ui) {
         card(ui,|ui|{
             ui.heading("Резервная копия и перенос данных");
+            ui.horizontal_wrapped(|ui|{ui.label("Хранить, дней");ui.add(egui::DragValue::new(&mut self.retention_days).range(30..=3650));ui.label("Макс. наблюдений/задач");ui.add(egui::DragValue::new(&mut self.history_limit).range(50..=5000));if ui.button("Архивировать и очистить сейчас").clicked(){self.apply_retention();}});
+            ui.label(RichText::new("Снимки радара старше срока перемещаются в archive/niche_snapshots; длинные истории наблюдений и журнал ограничиваются заданным числом записей.").small().color(Color32::GRAY));
             ui.horizontal_wrapped(|ui|{if ui.button("Создать резервную копию…").clicked(){self.backup_data();}if ui.button("Восстановить из копии…").clicked(){self.choose_restore();}if ui.button("Обновить журнал").clicked(){self.activity_log=read_json_or(self.out_dir.join("activity_log.json"),Vec::new());}});
             if !self.backup_message.is_empty(){ui.label(&self.backup_message);}
             ui.label(RichText::new("Копия включает файлы данных, настройки приложения, сохранённые поиски, избранное, отслеживание, журнал и снимки. Восстановление объединяет файлы и заменяет одноимённые.").small().color(Color32::GRAY));
@@ -1014,7 +1223,7 @@ impl PlatiApp {
             if !confirm{self.restore_candidate=None;}
         }
         ui.horizontal(|ui|{ui.heading("История задач");if ui.button("Очистить журнал").clicked(){self.activity_log.clear();let _=write_json_atomic(&self.out_dir.join("activity_log.json"),&self.activity_log);}});
-        card(ui,|ui|{egui::ScrollArea::vertical().max_height(560.0).show(ui,|ui|{egui::Grid::new("task_log_grid").striped(true).show(ui,|ui|{for h in ["Время","Задача","Статус","Подробности"]{ui.label(RichText::new(h).strong());}ui.end_row();for e in self.activity_log.iter().take(300){ui.label(date(e.at));ui.label(&e.task);ui.label(&e.status);ui.label(&e.details);ui.end_row();}});});});
+        card(ui,|ui|{egui::ScrollArea::vertical().max_height(560.0).show(ui,|ui|{egui::Grid::new("task_log_grid").striped(true).show(ui,|ui|{for h in ["Время","Задача","Статус","Попытки","Подробности"]{ui.label(RichText::new(h).strong());}ui.end_row();for e in self.activity_log.iter().take(300){ui.label(date(e.at));ui.label(&e.task);ui.label(&e.status);ui.label(e.attempts.to_string());ui.label(&e.details);ui.end_row();}});});});
     }
 
     fn message(&mut self,ui:&mut egui::Ui){if !self.message.is_empty(){card(ui,|ui|{ui.label(RichText::new(&self.message).color(if self.message.starts_with("Ошибка"){Color32::LIGHT_RED}else{Color32::from_rgb(134,239,172)}));});}}
@@ -1033,6 +1242,8 @@ impl eframe::App for PlatiApp {
         egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).fill(Color32::from_rgb(10,15,28)).inner_margin(egui::Margin::symmetric(22,16))).show(ctx,|ui|{
             self.header(ui);egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|match self.page{Page::Deals=>self.deals_view(ui),Page::Seller=>self.seller_view(ui),Page::Sellers=>self.discover_view(ui),Page::Radar=>self.radar_view(ui),Page::Watchlist=>self.watchlist_view(ui),Page::Activity=>self.activity_view(ui)});
         });
+        if self.note_editor.is_some(){self.note_dialog(ctx);}
+        if self.export_draft.is_some(){self.export_dialog(ctx);}
         self.persist_settings(ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
     }
@@ -1080,26 +1291,48 @@ fn matches_alert_target(prefs:&RadarAlertPrefs,title:&str,category:&str,seller_i
     matches_text&&matches_seller
 }
 
-fn export_xlsx_records<T:Serialize>(path:&Path,records:&[T])->Result<()> {
+fn export_cell(value:&serde_json::Value)->String {
+    match value {serde_json::Value::Null=>String::new(),serde_json::Value::String(s)=>s.clone(),serde_json::Value::Number(n)=>n.to_string(),serde_json::Value::Bool(b)=>b.to_string(),other=>other.to_string()}
+}
+
+fn selected_export_rows(columns:&[String],rows:&[serde_json::Value])->Vec<serde_json::Value> {
+    rows.iter().map(|row|{
+        let mut object=serde_json::Map::new();
+        for column in columns {if let Some(value)=row.get(column){object.insert(column.clone(),value.clone());}}
+        serde_json::Value::Object(object)
+    }).collect()
+}
+
+fn write_custom_export(path:&Path,columns:&[String],rows:&[serde_json::Value],format:ExportFormat)->Result<()> {
+    if columns.is_empty(){anyhow::bail!("Не выбраны столбцы для экспорта");}
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()){fs::create_dir_all(parent)?;}
-    let values:Vec<serde_json::Value>=records.iter().map(serde_json::to_value).collect::<std::result::Result<_,_>>()?;
-    let mut workbook=rust_xlsxwriter::Workbook::new();
-    let sheet=workbook.add_worksheet();
-    if let Some(serde_json::Value::Object(first))=values.first(){
-        let headers:Vec<String>=first.keys().cloned().collect();
-        for (col,key) in headers.iter().enumerate(){sheet.write_string(0,col as u16,key.as_str())?;}
-        for (row,value) in values.iter().enumerate(){
-            if let serde_json::Value::Object(object)=value {
-                for (col,key) in headers.iter().enumerate(){
-                    let cell=object.get(key).unwrap_or(&serde_json::Value::Null);let r=(row+1) as u32;let c=col as u16;
-                    match cell { serde_json::Value::String(v)=>{sheet.write_string(r,c,v.as_str())?;},serde_json::Value::Number(v)=>{if let Some(n)=v.as_f64(){sheet.write_number(r,c,n)?;}else{sheet.write_string(r,c,v.to_string())?;}},serde_json::Value::Bool(v)=>{sheet.write_boolean(r,c,*v)?;},_=>{} }
-                }
+    let rows=selected_export_rows(columns,rows);
+    match format {
+        ExportFormat::Json=>serde_json::to_writer_pretty(File::create(path)?,&rows)?,
+        ExportFormat::Csv=>{
+            let mut file=File::create(path)?;file.write_all(b"\xEF\xBB\xBF")?;let mut writer=csv::Writer::from_writer(file);
+            writer.write_record(columns.iter().map(String::as_str))?;
+            for row in &rows {
+                let values:Vec<String>=columns.iter().map(|column|{
+                    let value=row.get(column).unwrap_or(&serde_json::Value::Null);let mut text=export_cell(value);
+                    if matches!(value,serde_json::Value::String(_))&&matches!(text.trim_start().chars().next(),Some('='|'+'|'-'|'@')){text.insert(0,'\'');}
+                    text
+                }).collect();
+                writer.write_record(values)?;
             }
+            writer.flush()?;
         }
-        sheet.set_freeze_panes(1,0)?;
-        for col in 0..headers.len(){sheet.set_column_width(col as u16,18.0)?;}
+        ExportFormat::Xlsx=>{
+            let mut workbook=rust_xlsxwriter::Workbook::new();let sheet=workbook.add_worksheet();
+            for (col,key) in columns.iter().enumerate(){sheet.write_string(0,col as u16,key.as_str())?;}
+            for (row_index,row) in rows.iter().enumerate(){for (col,key) in columns.iter().enumerate(){
+                let value=row.get(key).unwrap_or(&serde_json::Value::Null);let r=(row_index+1) as u32;let c=col as u16;
+                match value {serde_json::Value::String(text)=>{sheet.write_string(r,c,text.as_str())?;},serde_json::Value::Number(number)=>{if let Some(value)=number.as_f64(){sheet.write_number(r,c,value)?;}else{sheet.write_string(r,c,number.to_string())?;}},serde_json::Value::Bool(value)=>{sheet.write_boolean(r,c,*value)?;},_=>{if !value.is_null(){sheet.write_string(r,c,export_cell(value))?;}}}
+            }}
+            sheet.set_freeze_panes(1,0)?;for col in 0..columns.len(){sheet.set_column_width(col as u16,18.0)?;}workbook.save(path)?;
+        }
     }
-    workbook.save(path)?;Ok(())
+    Ok(())
 }
 
 fn copy_tree(source:&Path,destination:&Path)->Result<()> {
