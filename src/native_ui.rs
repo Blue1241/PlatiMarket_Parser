@@ -82,6 +82,7 @@ fn resizable_header_cell(ui:&mut egui::Ui,index:usize,widths:&mut [f32],total_wi
 
 fn fixed_table_cell(ui:&mut egui::Ui,width:f32,height:f32,contents:impl FnOnce(&mut egui::Ui)){
     ui.allocate_ui_with_layout(Vec2::new(width,height),egui::Layout::top_down(egui::Align::LEFT),|cell|{
+        cell.set_min_width(width);
         let rect=cell.max_rect();
         contents(cell);
         cell.painter().line_segment([egui::pos2(rect.right(),rect.top()+5.0),egui::pos2(rect.right(),rect.bottom()-5.0)],Stroke::new(1.0_f32,Color32::from_rgb(37,51,72)));
@@ -1340,52 +1341,51 @@ impl PlatiApp {
             if self.radar_derived_loading||self.radar_visible_loading {return;}
             let Some(current)=self.snapshots.first() else{return;};
             let table_width=ui.available_width();
-            let column_budget=(table_width-6.0*9.0).max(1100.0);
+            let column_budget=(table_width-6.0*8.0).max(1100.0);
             let labels=["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"];
             let mut toggle_favorite=None;
             let row_height=68.0;
             let table_height=(viewport_height*0.42).clamp(260.0,520.0);
-            // A dedicated horizontal viewport keeps this table's header and rows in sync.
-            egui::ScrollArea::horizontal().id_salt("radar_table_horizontal").auto_shrink([false,false]).show(ui,|ui|{
-                ui.horizontal(|ui|{
-                    ui.spacing_mut().item_spacing.x=9.0;
-                    for (index,label) in labels.into_iter().enumerate(){
-                        resizable_header_cell(ui,index,&mut self.radar_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new(label).strong().color(Color32::from_rgb(125,211,252))));});
-                    }
-                });
-                let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
-                let content_width=widths.iter().sum::<f32>()+6.0*9.0;
+            // One bidirectional table scroller owns both header and rows. The Grid keeps
+            // each column's width identical, while show_rows virtualizes large snapshots.
+            let content_width=column_budget+6.0*8.0;
+            egui::ScrollArea::both().id_salt("radar_table_scroll").auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len()+1,|ui,visible_rows|{
                 ui.set_min_width(content_width);
-                egui::ScrollArea::vertical().id_salt("radar_table_rows").auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
-                    ui.set_min_width(content_width);
-                    for row in range {
-                        let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
-                        let Some(product)=current.products.get(m.product_index) else{continue;};
-                        let yes=self.favorites.contains(&product.item_id);
-                        ui.allocate_ui_with_layout(Vec2::new(content_width,row_height),egui::Layout::left_to_right(egui::Align::Center),|row_ui|{
-                            row_ui.set_min_width(content_width);
-                            let row_rect=row_ui.max_rect();
-                            let row_color=if row%2==0{Color32::from_rgb(17,26,45)}else{Color32::from_rgb(20,31,52)};
-                            row_ui.painter().rect_filled(row_rect,4.0,row_color);
-                            row_ui.spacing_mut().item_spacing.x=9.0;
-                            if row_ui.add_sized([widths[0],30.0],egui::Button::new(if yes{"★"}else{"☆"})).on_hover_text("Добавить или убрать из избранного").clicked(){toggle_favorite=Some(product.item_id);}
-                            row_ui.allocate_ui_with_layout(Vec2::new(widths[1],row_height),egui::Layout::top_down(egui::Align::LEFT),|cell|{
-                                cell.set_min_width(widths[1]);
-                                cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);
-                                cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());
-                            });
-                            row_ui.add_sized([widths[2],row_height],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())).wrap());
-                            row_ui.add_sized([widths[3],row_height],egui::Label::new(format!("{:.0} ₽",product.price_rub)).wrap());
-                            row_ui.add_sized([widths[4],row_height],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)).wrap());
-                            row_ui.add_sized([widths[5],row_height],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())).wrap());
-                            row_ui.add_sized([widths[6],row_height],egui::Label::new(format!("{:.1}",m.opportunity_score)).wrap());
-                            let mut boundary=row_rect.left();
-                            for width in widths.iter().take(widths.len()-1){
-                                boundary+=width+9.0;
-                                let x=boundary-13.5;
-                                row_ui.painter().line_segment([egui::pos2(x,row_rect.top()+6.0),egui::pos2(x,row_rect.bottom()-6.0)],Stroke::new(1.0_f32,Color32::from_rgb(37,51,72)));
+                egui::Grid::new("radar_table_grid").striped(true).spacing([8.0,6.0]).min_col_width(1.0).show(ui,|ui|{
+                    for table_row in visible_rows {
+                        if table_row==0 {
+                            for (index,label) in labels.into_iter().enumerate(){
+                                resizable_header_cell(ui,index,&mut self.radar_column_widths,column_budget,|ui,width|{
+                                    ui.add_sized([width,row_height],egui::Label::new(RichText::new(label).strong().color(Color32::from_rgb(125,211,252))));
+                                });
                             }
+                            ui.end_row();
+                            continue;
+                        }
+                        let row=table_row-1;
+                        let metric_index=self.radar_visible[row];
+                        let metric=self.radar_metrics[metric_index];
+                        let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
+                        let Some(product)=current.products.get(metric.product_index) else{
+                            for width in widths{fixed_table_cell(ui,width,row_height,|_|{});}
+                            ui.end_row();
+                            continue;
+                        };
+                        let is_favorite=self.favorites.contains(&product.item_id);
+                        fixed_table_cell(ui,widths[0],row_height,|cell|{
+                            cell.add_space((row_height-30.0)*0.5);
+                            if cell.add_sized([cell.available_width(),30.0],egui::Button::new(if is_favorite{"★"}else{"☆"})).on_hover_text("Добавить или убрать из избранного").clicked(){toggle_favorite=Some(product.item_id);}
                         });
+                        fixed_table_cell(ui,widths[1],row_height,|cell|{
+                            cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);
+                            cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());
+                        });
+                        fixed_table_cell(ui,widths[2],row_height,|cell|{cell.vertical_centered(|cell|{cell.label(metric.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()));});});
+                        fixed_table_cell(ui,widths[3],row_height,|cell|{cell.vertical_centered(|cell|{cell.label(format!("{:.0} ₽",product.price_rub));});});
+                        fixed_table_cell(ui,widths[4],row_height,|cell|{cell.vertical_centered(|cell|{cell.label(format!("{} / {}",metric.sellers_count,metric.listings_count));});});
+                        fixed_table_cell(ui,widths[5],row_height,|cell|{cell.vertical_centered(|cell|{cell.label(metric.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into()));});});
+                        fixed_table_cell(ui,widths[6],row_height,|cell|{cell.vertical_centered(|cell|{cell.label(format!("{:.1}",metric.opportunity_score));});});
+                        ui.end_row();
                     }
                 });
             });
