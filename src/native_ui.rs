@@ -931,12 +931,15 @@ impl PlatiApp {
 
     fn export_dialog(&mut self,ctx:&egui::Context) {
         let Some(mut draft)=self.export_draft.take() else{return};let mut open=true;let mut action=None;let mut move_up=None;let mut move_down=None;
-        egui::Window::new(format!("Экспорт · {}",draft.title)).open(&mut open).resizable(true).default_width(760.0).show(ctx,|ui|{
+        let screen=ctx.input(|i|i.viewport().inner_rect.map(|r|r.size()).unwrap_or(Vec2::new(1000.0,720.0)));
+        let dialog_width=(screen.x*0.72).clamp(440.0,920.0).min((screen.x-24.0).max(400.0));
+        let list_height=(screen.y*0.32).clamp(120.0,280.0);
+        egui::Window::new(format!("Экспорт · {}",draft.title)).open(&mut open).resizable(true).default_width(dialog_width).show(ctx,|ui|{
             ui.label(format!("{} строк · выберите столбцы и порядок; предпросмотр показывает первые 5 строк",draft.rows.len()));
             ui.separator();
             ui.columns(2,|columns|{
                 columns[0].label(RichText::new("Столбцы (↑ / ↓ меняют порядок)").strong());
-                egui::ScrollArea::vertical().max_height(220.0).show(&mut columns[0],|ui|{
+                egui::ScrollArea::vertical().max_height(list_height).show(&mut columns[0],|ui|{
                     for (i,key) in draft.columns.clone().iter().enumerate(){
                         ui.horizontal(|ui|{let mut selected=draft.selected.contains(key);if ui.checkbox(&mut selected,key).changed(){if selected{draft.selected.insert(key.clone());}else{draft.selected.remove(key);}}
                             if ui.small_button("↑").clicked()&&i>0{move_up=Some(i);}
@@ -946,7 +949,7 @@ impl PlatiApp {
                 });
                 columns[1].label(RichText::new("Предпросмотр").strong());
                 let active:Vec<&String>=draft.columns.iter().filter(|c|draft.selected.contains(*c)).collect();
-                egui::ScrollArea::both().max_height(220.0).show(&mut columns[1],|ui|{
+                egui::ScrollArea::both().max_height(list_height).show(&mut columns[1],|ui|{
                     egui::Grid::new("export_preview_grid").striped(true).show(ui,|ui|{for key in &active{ui.label(RichText::new(key.as_str()).strong());}ui.end_row();for row in draft.rows.iter().take(5){for key in &active{ui.label(export_cell(row.get(*key).unwrap_or(&serde_json::Value::Null)));}ui.end_row();}});
                 });
             });
@@ -973,21 +976,21 @@ impl PlatiApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let compact=ui.available_width()<190.0;
         ui.add_space(7.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PR").size(25.0).strong().color(Color32::from_rgb(56,189,248)));
+            ui.label(RichText::new("PR").size(if compact{22.0}else{25.0}).strong().color(Color32::from_rgb(56,189,248)));
             ui.vertical(|ui| { ui.label(RichText::new("PLATI RADAR").strong()); ui.label(RichText::new("АНАЛИТИКА МАРКЕТПЛЕЙСА").small().color(Color32::GRAY)); });
         });
         ui.add_space(25.0);
         ui.label(RichText::new("РАБОЧЕЕ ПРОСТРАНСТВО").small().color(Color32::GRAY));
         ui.add_space(8.0);
-        for (page, label) in [(Page::Deals,"⌕  Поиск предложений"),(Page::Seller,"◉  Профиль продавца"),(Page::Sellers,"▤  База продавцов"),(Page::Radar,"◌  Радар ниш"),(Page::Watchlist,"★  Отслеживание"),(Page::Activity,"≡  Журнал и резервные копии")] {
-            if ui.selectable_label(self.page == page, label).clicked() { self.page = page; }
-        }
+        let pages=if compact {[(Page::Deals,"⌕  Поиск"),(Page::Seller,"◉  Продавец"),(Page::Sellers,"▤  База продавцов"),(Page::Radar,"◌  Радар"),(Page::Watchlist,"★  Отслеживание"),(Page::Activity,"≡  Журнал / копии")]} else {[(Page::Deals,"⌕  Поиск предложений"),(Page::Seller,"◉  Профиль продавца"),(Page::Sellers,"▤  База продавцов"),(Page::Radar,"◌  Радар ниш"),(Page::Watchlist,"★  Отслеживание"),(Page::Activity,"≡  Журнал и резервные копии")]};
+        for (page,label) in pages {if ui.selectable_label(self.page==page,label).clicked(){self.page=page;}}
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.separator();
-            if ui.small_button("Открыть папку данных").clicked() { self.open_output_dir(); }
-            if ui.small_button("Выбрать папку данных…").clicked() { self.choose_output_dir(); }
+            if ui.add_sized([ui.available_width(),26.0],egui::Button::new(if compact{"Открыть папку"}else{"Открыть папку данных"})).clicked(){self.open_output_dir();}
+            if ui.add_sized([ui.available_width(),26.0],egui::Button::new(if compact{"Выбрать папку…"}else{"Выбрать папку данных…"})).clicked(){self.choose_output_dir();}
             ui.label(RichText::new(format!("Данные: {}", self.out_dir.display())).small().color(Color32::GRAY));
             ui.label(RichText::new("Нативный интерфейс · Rust").small().color(Color32::GRAY));
         });
@@ -1010,7 +1013,8 @@ impl PlatiApp {
     }
 
     fn deals_view(&mut self, ui: &mut egui::Ui) {
-        let results_height=(ui.available_height()-330.0).max(360.0);
+        let available_height=ui.available_height().min(1200.0);
+        let results_height=(available_height-300.0).clamp(170.0,available_height.max(170.0));
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Быстрый поиск").strong());
@@ -1030,7 +1034,7 @@ impl PlatiApp {
                 } else if ui.add_enabled(self.query.trim().chars().count() >= 3, egui::Button::new("Найти").fill(Color32::from_rgb(2,132,199))).clicked() { self.send_search(); }
             });
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.saved_search_name).desired_width(150.0).hint_text("Название фильтра"));
+                ui.add(egui::TextEdit::singleline(&mut self.saved_search_name).desired_width((ui.available_width()*0.2).clamp(110.0,200.0)).hint_text("Название фильтра"));
                 if ui.button("Сохранить фильтр").clicked(){self.save_search_preset();}
                 let selected=self.saved_searches.get(self.selected_saved_search).map(|p|p.name.as_str()).unwrap_or("Сохранённые поиски");
                 let mut chosen_search=None;
@@ -1050,30 +1054,47 @@ impl PlatiApp {
                 if !self.search_queue.is_empty() && ui.small_button("Очистить очередь").clicked(){self.search_queue.clear();self.search_queue_running=false;}
             });
             egui::CollapsingHeader::new("Фильтры и параметры").default_open(true).show(ui, |ui| {
-                egui::Grid::new("search_config").num_columns(4).spacing([12.0,8.0]).show(ui, |ui| {
-                    ui.vertical(|ui| {ui.label("Страниц (1–5)");ui.add(egui::DragValue::new(&mut self.pages).range(1..=5));});
-                    ui.vertical(|ui| {ui.label("Мин. отзывов");ui.add(egui::DragValue::new(&mut self.min_reviews).range(0..=1_000_000));});
-                    ui.vertical(|ui| {ui.label("Макс. негатив, %");ui.add(egui::DragValue::new(&mut self.max_negative).range(0.0..=100.0));});
-                    ui.vertical(|ui| {ui.label("Проверить опции карточек");ui.add(egui::DragValue::new(&mut self.inspect_limit).range(0..=200));});
-                    ui.vertical(|ui| {ui.label("Ключ тарифа");ui.text_edit_singleline(&mut self.keyword);});
-                    ui.vertical(|ui| {ui.label("Минус-слова через запятую");ui.text_edit_singleline(&mut self.exclude);});
-                    ui.vertical(|ui| {ui.label("Сортировка");egui::ComboBox::from_id_salt("sort").selected_text(sort_name(self.sort)).show_ui(ui,|ui|{for m in [SortMode::RealPrice,SortMode::StorePrice,SortMode::Reviews,SortMode::Smart]{ui.selectable_value(&mut self.sort,m,sort_name(m));}});});
-                    ui.end_row();
-                });
+                if ui.available_width()<900.0 {
+                    ui.columns(2,|columns|{
+                        columns[0].vertical(|ui|{ui.label("Страниц (1–5)");ui.add(egui::DragValue::new(&mut self.pages).range(1..=5));});
+                        columns[1].vertical(|ui|{ui.label("Мин. отзывов");ui.add(egui::DragValue::new(&mut self.min_reviews).range(0..=1_000_000));});
+                    });
+                    ui.columns(2,|columns|{
+                        columns[0].vertical(|ui|{ui.label("Макс. негатив, %");ui.add(egui::DragValue::new(&mut self.max_negative).range(0.0..=100.0));});
+                        columns[1].vertical(|ui|{ui.label("Опции карточек");ui.add(egui::DragValue::new(&mut self.inspect_limit).range(0..=200));});
+                    });
+                    ui.columns(2,|columns|{
+                        columns[0].vertical(|ui|{ui.label("Ключ тарифа");ui.add_sized([ui.available_width(),28.0],egui::TextEdit::singleline(&mut self.keyword));});
+                        columns[1].vertical(|ui|{ui.label("Минус-слова");ui.add_sized([ui.available_width(),28.0],egui::TextEdit::singleline(&mut self.exclude));});
+                    });
+                    ui.vertical(|ui|{ui.label("Сортировка");egui::ComboBox::from_id_salt("sort").selected_text(sort_name(self.sort)).width(ui.available_width()).show_ui(ui,|ui|{for m in [SortMode::RealPrice,SortMode::StorePrice,SortMode::Reviews,SortMode::Smart]{ui.selectable_value(&mut self.sort,m,sort_name(m));}});});
+                } else {
+                    ui.columns(4,|columns|{
+                        columns[0].vertical(|ui|{ui.label("Страниц (1–5)");ui.add(egui::DragValue::new(&mut self.pages).range(1..=5));});
+                        columns[1].vertical(|ui|{ui.label("Мин. отзывов");ui.add(egui::DragValue::new(&mut self.min_reviews).range(0..=1_000_000));});
+                        columns[2].vertical(|ui|{ui.label("Макс. негатив, %");ui.add(egui::DragValue::new(&mut self.max_negative).range(0.0..=100.0));});
+                        columns[3].vertical(|ui|{ui.label("Опции карточек");ui.add(egui::DragValue::new(&mut self.inspect_limit).range(0..=200));});
+                    });
+                    ui.add_space(6.0);
+                    ui.columns(4,|columns|{
+                        columns[0].vertical(|ui|{ui.label("Ключ тарифа");ui.add_sized([ui.available_width(),28.0],egui::TextEdit::singleline(&mut self.keyword));});
+                        columns[1].vertical(|ui|{ui.label("Минус-слова (через запятую)");ui.add_sized([ui.available_width(),28.0],egui::TextEdit::singleline(&mut self.exclude));});
+                        columns[2].vertical(|ui|{ui.label("Сортировка");egui::ComboBox::from_id_salt("sort").selected_text(sort_name(self.sort)).width(ui.available_width()).show_ui(ui,|ui|{for m in [SortMode::RealPrice,SortMode::StorePrice,SortMode::Reviews,SortMode::Smart]{ui.selectable_value(&mut self.sort,m,sort_name(m));}});});
+                    });
+                }
             });
         });
         self.message(ui);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Результаты");
             ui.label(RichText::new(format!("{} карточек",self.deals.len())).color(Color32::GRAY));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                ui.add(egui::TextEdit::singleline(&mut self.deals_filter).desired_width(200.0).hint_text("Фильтр названия / продавца"));
-                if ui.button("Экспорт / настроить…").clicked(){let f=self.deals_filter.to_lowercase();let rows:Vec<ProductDeal>=self.deals.iter().filter(|d|f.is_empty()||d.title.to_lowercase().contains(&f)||d.seller_name.to_lowercase().contains(&f)).cloned().collect();self.prepare_export("Предложения","deals",&rows);}
-            });
+            ui.add(egui::TextEdit::singleline(&mut self.deals_filter).desired_width((ui.available_width()*0.28).clamp(130.0,260.0)).hint_text("Фильтр названия / продавца"));
+            if ui.button("Экспорт / настроить…").clicked(){let f=self.deals_filter.to_lowercase();let rows:Vec<ProductDeal>=self.deals.iter().filter(|d|f.is_empty()||d.title.to_lowercase().contains(&f)||d.seller_name.to_lowercase().contains(&f)).cloned().collect();self.prepare_export("Предложения","deals",&rows);}
         });
         card(ui,|ui|{
+            let deal_col_width=((ui.available_width()-60.0)/6.0).clamp(74.0,220.0);
             egui::ScrollArea::both().min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
-                egui::Grid::new("deal_rows").striped(true).spacing([12.0,8.0]).min_col_width(55.0).show(ui,|ui|{
+                egui::Grid::new("deal_rows").striped(true).spacing([12.0,8.0]).min_col_width(deal_col_width).show(ui,|ui|{
                     ui.label(RichText::new("Карточка").strong().color(Color32::from_rgb(125,211,252)));
                     ui.label(RichText::new("Тариф").strong().color(Color32::from_rgb(125,211,252)));
                     for (head, mode) in [("Цена",SortMode::RealPrice),("Отзывы",SortMode::Reviews)] { if ui.selectable_label(self.sort==mode,RichText::new(head).strong()).clicked(){self.sort=mode;} }
@@ -1104,7 +1125,9 @@ impl PlatiApp {
 
     fn options_dialog(&mut self, ctx:&egui::Context) {
         let mut open=self.options_open;
-        egui::Window::new("Варианты и тарифы").open(&mut open).default_width(520.0).show(ctx,|ui|{
+        let screen_width=ctx.input(|i|i.viewport().inner_rect.map(|r|r.width()).unwrap_or(1000.0));
+        let dialog_width=(screen_width*0.56).clamp(400.0,720.0).min((screen_width-24.0).max(360.0));
+        egui::Window::new("Варианты и тарифы").open(&mut open).resizable(true).default_width(dialog_width).show(ctx,|ui|{
             ui.label(RichText::new(&self.options_title).strong());
             ui.hyperlink_to(format!("Карточка {} ↗",self.options_id),format!("https://plati.market/itm/{}",self.options_id));
             if self.options_busy {ui.spinner();ui.label("Загружаем настройки Digiseller…");}
@@ -1147,12 +1170,23 @@ impl PlatiApp {
     fn discover_view(&mut self,ui:&mut egui::Ui){
         card(ui,|ui|{
             ui.heading("Сбор продавцов по категориям");ui.label("Категории cats.xml и обогащение профилей HTML-данными.");
-            ui.horizontal(|ui|{ui.vertical(|ui|{ui.label("Макс. категорий");ui.add(egui::DragValue::new(&mut self.max_categories).range(1..=389));});ui.vertical(|ui|{ui.label("Профилей обогатить");ui.add(egui::DragValue::new(&mut self.enrich_limit).range(0..=100));});if self.discover_busy{if ui.button("Отменить сбор").clicked(){self.cancel_discover();}}else if ui.add(egui::Button::new("Начать сбор").fill(Color32::from_rgb(2,132,199))).clicked(){self.send_discover();}});
+            if ui.available_width()<700.0 {
+                ui.columns(2,|columns|{
+                    columns[0].vertical(|ui|{ui.label("Макс. категорий");ui.add(egui::DragValue::new(&mut self.max_categories).range(1..=389));});
+                    columns[1].vertical(|ui|{ui.label("Профилей обогатить");ui.add(egui::DragValue::new(&mut self.enrich_limit).range(0..=100));if self.discover_busy{if ui.add_sized([ui.available_width(),28.0],egui::Button::new("Отменить сбор")).clicked(){self.cancel_discover();}}else if ui.add_sized([ui.available_width(),28.0],egui::Button::new("Начать сбор").fill(Color32::from_rgb(2,132,199))).clicked(){self.send_discover();}});
+                });
+            } else {
+                ui.columns(3,|columns|{
+                    columns[0].vertical(|ui|{ui.label("Макс. категорий");ui.add(egui::DragValue::new(&mut self.max_categories).range(1..=389));});
+                    columns[1].vertical(|ui|{ui.label("Профилей обогатить");ui.add(egui::DragValue::new(&mut self.enrich_limit).range(0..=100));});
+                    columns[2].vertical_centered(|ui|{ui.add_space(18.0);if self.discover_busy{if ui.add_sized([ui.available_width(),30.0],egui::Button::new("Отменить сбор")).clicked(){self.cancel_discover();}}else if ui.add_sized([ui.available_width(),30.0],egui::Button::new("Начать сбор").fill(Color32::from_rgb(2,132,199))).clicked(){self.send_discover();}});
+                });
+            }
             if self.discover_busy { if self.discover_progress.1>0 { let f=self.discover_progress.0 as f32/self.discover_progress.1 as f32;ui.add(egui::ProgressBar::new(f).show_percentage().text(format!("{} / {} категорий",self.discover_progress.0,self.discover_progress.1))); } ui.label(&self.discover_progress.2); }
         }); self.message(ui);
-        ui.horizontal(|ui|{ui.heading("Продавцы");ui.label(RichText::new(format!("{} записей",self.sellers.len())).color(Color32::GRAY));ui.add(egui::TextEdit::singleline(&mut self.sellers_filter).desired_width(180.0).hint_text("Фильтр"));if ui.button("Экспорт / настроить…").clicked(){let f=self.sellers_filter.to_lowercase();let rows:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();self.prepare_export("Продавцы","sellers",&rows);}});
-        card(ui,|ui|{egui::ScrollArea::both().max_height(590.0).show(ui,|ui|{
-            egui::Grid::new("seller_list").striped(true).spacing([16.0,7.0]).show(ui,|ui|{
+        ui.horizontal_wrapped(|ui|{ui.heading("Продавцы");ui.label(RichText::new(format!("{} записей",self.sellers.len())).color(Color32::GRAY));ui.add(egui::TextEdit::singleline(&mut self.sellers_filter).desired_width((ui.available_width()*0.24).clamp(130.0,240.0)).hint_text("Фильтр"));if ui.button("Экспорт / настроить…").clicked(){let f=self.sellers_filter.to_lowercase();let rows:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();self.prepare_export("Продавцы","sellers",&rows);}});
+        card(ui,|ui|{let seller_col_width=((ui.available_width()-80.0)/6.0).clamp(78.0,220.0);let seller_list_height=(ui.available_height()-150.0).clamp(180.0,720.0);egui::ScrollArea::both().max_height(seller_list_height).show(ui,|ui|{
+            egui::Grid::new("seller_list").striped(true).spacing([16.0,7.0]).min_col_width(seller_col_width).show(ui,|ui|{
                 ui.label(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252)));
                 for (title,sort) in [("Рейтинг",SellerSort::Rating),("Продажи",SellerSort::Sales),("Отзывы",SellerSort::Reviews)] { if ui.selectable_label(self.seller_sort==sort,title).clicked(){self.seller_sort=sort;} }
                 ui.label(RichText::new("Возвраты").strong().color(Color32::from_rgb(125,211,252)));ui.label(RichText::new("Профиль").strong().color(Color32::from_rgb(125,211,252)));ui.end_row();
@@ -1184,10 +1218,12 @@ impl PlatiApp {
             if let Some(e)=&self.progress.error{ui.colored_label(Color32::LIGHT_RED,e);}
         });
         self.message(ui);
-        card(ui,|ui|{ui.label(RichText::new("История изменения продаж").strong());history_plot(ui,&self.history);});
+        let viewport_height=ui.ctx().input(|i|i.viewport().inner_rect.map(|r|r.height()).unwrap_or(800.0));
+        let chart_height=(viewport_height*0.12).clamp(58.0,120.0);
+        card(ui,|ui|{ui.label(RichText::new("История изменения продаж").strong());history_plot(ui,&self.history,chart_height);});
         card(ui,|ui|{ui.label(RichText::new("Что изменилось с прошлого снимка").strong());self.snapshot_comparison(ui);});
         ui.horizontal_wrapped(|ui|{
-            ui.heading("Возможности");ui.add(egui::TextEdit::singleline(&mut self.niche_filter).desired_width(150.0).hint_text("Товар / категория"));
+            ui.heading("Возможности");ui.add(egui::TextEdit::singleline(&mut self.niche_filter).desired_width((ui.available_width()*0.18).clamp(120.0,240.0)).hint_text("Товар / категория"));
             ui.label("Мин. Δ");ui.add(egui::DragValue::new(&mut self.min_delta).range(-1_000_000..=1_000_000));ui.label("Макс. продавцов");ui.add(egui::DragValue::new(&mut self.max_sellers).range(1..=100_000));
             ui.label("Макс. цена");ui.add(egui::DragValue::new(&mut self.max_price).range(0.0..=100_000_000.0));ui.label("Макс. наценка %");ui.add(egui::DragValue::new(&mut self.max_markup).range(-100.0..=100_000.0));
             egui::ComboBox::from_id_salt("radar_sort").selected_text(radar_sort_name(self.radar_sort)).show_ui(ui,|ui|{for s in [RadarSort::Opportunity,RadarSort::Delta,RadarSort::Price,RadarSort::Sellers]{ui.selectable_value(&mut self.radar_sort,s,radar_sort_name(s));}});
@@ -1199,22 +1235,34 @@ impl PlatiApp {
             ui.horizontal(|ui|{ui.label(RichText::new(format!("Возможности · {}{}",self.radar_visible.len(),if self.radar_visible.len()==2000{"+"}else{""})).strong());if self.radar_derived_loading||self.radar_visible_loading{ui.spinner();ui.label("Подготовка данных в фоне…");}else if self.radar_metrics.is_empty(){ui.label("Нет данных радара");}});
             if self.radar_derived_loading||self.radar_visible_loading {return;}
             let Some(current)=self.snapshots.first() else{return;};
-            ui.horizontal(|ui|{for h in ["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"]{ui.label(RichText::new(h).strong().color(Color32::from_rgb(125,211,252)));}});
+            let table_width=ui.available_width();let compact_rows=table_width<900.0;
+            if compact_rows{ui.horizontal_wrapped(|ui|{for h in ["Карточка","Δ","Цена","Продавцы","Наценка","Балл"]{ui.label(RichText::new(h).strong().color(Color32::from_rgb(125,211,252)));}});}
+            else{ui.horizontal(|ui|{for h in ["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"]{ui.label(RichText::new(h).strong().color(Color32::from_rgb(125,211,252)));}});}
             let mut toggle_favorite=None;
-            egui::ScrollArea::both().max_height(ui.available_height().max(360.0)).show_rows(ui,58.0,self.radar_visible.len(),|ui,range|{
+            let radar_title_width=(table_width-470.0).max(220.0);
+            let row_height=if compact_rows{78.0}else{58.0};
+            let table_height=ui.available_height().clamp(120.0,900.0);
+            egui::ScrollArea::both().min_scrolled_height(table_height).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
                 for row in range {
                     let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
                     let Some(product)=current.products.get(m.product_index) else{continue;};
-                    ui.horizontal(|ui|{
-                        let yes=self.favorites.contains(&product.item_id);
-                        if ui.button(if yes{"★"}else{"☆"}).clicked(){toggle_favorite=Some(product.item_id);}
-                        ui.allocate_ui_with_layout(egui::vec2(340.0,56.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{ui.hyperlink_to(&product.title,&product.item_url);ui.label(RichText::new(&product.category).small().color(Color32::GRAY));});
-                        ui.add_sized([82.0,24.0],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())));
-                        ui.add_sized([90.0,24.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));
-                        ui.add_sized([90.0,24.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));
-                        ui.add_sized([90.0,24.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));
-                        ui.add_sized([50.0,24.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));
-                    });
+                    let yes=self.favorites.contains(&product.item_id);
+                    if compact_rows {
+                        ui.allocate_ui_with_layout(egui::vec2(table_width,row_height-4.0),egui::Layout::top_down(egui::Align::LEFT),|row_ui|{
+                            row_ui.horizontal(|row_ui|{if row_ui.small_button(if yes{"★"}else{"☆"}).clicked(){toggle_favorite=Some(product.item_id);}row_ui.hyperlink_to(&product.title,&product.item_url);});
+                            row_ui.horizontal_wrapped(|row_ui|{row_ui.label(format!("Δ {}",m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())));row_ui.label(format!("{:.0} ₽",product.price_rub));row_ui.label(format!("{} / {} продавцов",m.sellers_count,m.listings_count));row_ui.label(m.markup_percent.map(|x|format!("{x:+.1}% наценка")).unwrap_or_else(||"— наценка".into()));row_ui.label(format!("Балл {:.1}",m.opportunity_score));});
+                        });
+                    } else {
+                        ui.horizontal(|ui|{
+                            if ui.small_button(if yes{"★"}else{"☆"}).clicked(){toggle_favorite=Some(product.item_id);}
+                            ui.allocate_ui_with_layout(egui::vec2(radar_title_width,56.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{ui.hyperlink_to(&product.title,&product.item_url);ui.label(RichText::new(&product.category).small().color(Color32::GRAY));});
+                            ui.add_sized([82.0,24.0],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())));
+                            ui.add_sized([90.0,24.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));
+                            ui.add_sized([90.0,24.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));
+                            ui.add_sized([90.0,24.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));
+                            ui.add_sized([50.0,24.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));
+                        });
+                    }
                 }
             });
             if let Some(id)=toggle_favorite{if self.favorites.remove(&id)==false{self.favorites.insert(id);}let _=write_json_atomic(&self.out_dir.join("niche_favorites.json"),&self.favorites);self.radar_filter_key.clear();}
@@ -1229,12 +1277,12 @@ impl PlatiApp {
                 ui.checkbox(&mut self.price_alerts,"Снижение цены");ui.label("От, ₽");ui.add(egui::DragValue::new(&mut self.price_drop_threshold).range(0.0..=1_000_000.0));
                 ui.checkbox(&mut self.sales_alerts,"Рост продаж");ui.label("От, шт.");ui.add(egui::DragValue::new(&mut self.sales_growth_threshold).range(1..=1_000_000));
             });
-            ui.horizontal_wrapped(|ui|{ui.label("Текст / категории (через запятую)");ui.add(egui::TextEdit::singleline(&mut self.alert_filter).desired_width(310.0).hint_text("ключевые слова или названия категорий"));ui.checkbox(&mut self.tracked_sellers_only,"Только выбранные продавцы");});
+            ui.horizontal_wrapped(|ui|{ui.label("Текст / категории (через запятую)");ui.add(egui::TextEdit::singleline(&mut self.alert_filter).desired_width((ui.available_width()*0.45).clamp(140.0,380.0)).hint_text("ключевые слова или названия категорий"));ui.checkbox(&mut self.tracked_sellers_only,"Только выбранные продавцы");});
             ui.label(RichText::new("Карточки обновляются при следующих поисках, продавцы — при повторной проверке их профиля. Данные и история хранятся локально.").small().color(Color32::GRAY));
         });
-        ui.horizontal(|ui|{ui.heading(format!("Карточки · {}",self.watchlist.len()));ui.add(egui::TextEdit::singleline(&mut self.watch_filter).desired_width(210.0).hint_text("Фильтр по метке, заметке, товару"));});
+        ui.horizontal_wrapped(|ui|{ui.heading(format!("Карточки · {}",self.watchlist.len()));ui.add(egui::TextEdit::singleline(&mut self.watch_filter).desired_width((ui.available_width()*0.32).clamp(140.0,300.0)).hint_text("Фильтр по метке, заметке, товару"));});
         let filter=self.watch_filter.trim().to_lowercase();let mut remove_products=Vec::new();let mut edit_request=None;
-        egui::ScrollArea::vertical().max_height(330.0).show(ui,|ui|{
+        egui::ScrollArea::vertical().max_height((ui.available_height()*0.48).clamp(150.0,520.0)).show(ui,|ui|{
             for w in &self.watchlist {
                 let searchable=format!("{} {} {} {}",w.title,w.seller_name,w.note,w.tags.join(" ")).to_lowercase();
                 if !filter.is_empty()&&!searchable.contains(&filter){continue;}
@@ -1248,7 +1296,7 @@ impl PlatiApp {
         if !remove_products.is_empty(){self.watchlist.retain(|w|!remove_products.contains(&w.item_id));self.persist_watchlist();}
         ui.heading(format!("Продавцы · {}",self.watched_sellers.len()));
         let mut remove_sellers=Vec::new();
-        egui::ScrollArea::vertical().max_height(300.0).show(ui,|ui|{
+        egui::ScrollArea::vertical().max_height((ui.available_height()*0.42).clamp(140.0,480.0)).show(ui,|ui|{
             for w in &self.watched_sellers {
                 let searchable=format!("{} {} {} {}",w.name,w.note,w.tags.join(" "),w.seller_id).to_lowercase();if !filter.is_empty()&&!searchable.contains(&filter){continue;}
                 let latest=w.observations.last();let previous=w.observations.iter().rev().nth(1);
@@ -1262,7 +1310,7 @@ impl PlatiApp {
     fn note_dialog(&mut self,ctx:&egui::Context) {
         let Some(mut editor)=self.note_editor.take() else{return};let mut open=true;let mut save=false;
         egui::Window::new("Заметка и метки").open(&mut open).show(ctx,|ui|{
-            ui.label("Заметка");ui.add(egui::TextEdit::multiline(&mut editor.note).desired_rows(4).desired_width(420.0));
+            ui.label("Заметка");ui.add(egui::TextEdit::multiline(&mut editor.note).desired_rows(4).desired_width(ui.available_width()));
             ui.label("Метки через запятую");ui.text_edit_singleline(&mut editor.tags);
             if ui.button("Сохранить").clicked(){save=true;}
         });
@@ -1279,7 +1327,7 @@ impl PlatiApp {
         let Some(comparison)=&self.radar_comparison else{ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;};
         if comparison.previous_at==0 {ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;}
         ui.label(format!("{} → {} · найдено {} изменений · +{} новых · −{} пропавших",date(comparison.previous_at),date(comparison.current_at),comparison.total_changes,comparison.added,comparison.missing));
-        egui::ScrollArea::vertical().max_height(220.0).show(ui,|ui|{
+        egui::ScrollArea::vertical().max_height((ui.available_height()*0.22).clamp(72.0,150.0)).show(ui,|ui|{
             for change in &comparison.top_changes {
                 ui.horizontal(|ui|{ui.label(RichText::new(&change.detail).strong().color(Color32::from_rgb(125,211,252)));ui.label(&change.title);});
             }
@@ -1302,7 +1350,7 @@ impl PlatiApp {
             if !confirm{self.restore_candidate=None;}
         }
         ui.horizontal(|ui|{ui.heading("История задач");if ui.button("Очистить журнал").clicked(){self.activity_log.clear();let _=write_json_atomic(&self.out_dir.join("activity_log.json"),&self.activity_log);}});
-        card(ui,|ui|{egui::ScrollArea::vertical().max_height(560.0).show(ui,|ui|{egui::Grid::new("task_log_grid").striped(true).show(ui,|ui|{for h in ["Время","Задача","Статус","Попытки","Подробности"]{ui.label(RichText::new(h).strong());}ui.end_row();for e in self.activity_log.iter().take(300){ui.label(date(e.at));ui.label(&e.task);ui.label(&e.status);ui.label(e.attempts.to_string());ui.label(&e.details);ui.end_row();}});});});
+        card(ui,|ui|{egui::ScrollArea::both().max_height((ui.available_height()-160.0).clamp(180.0,720.0)).show(ui,|ui|{egui::Grid::new("task_log_grid").striped(true).show(ui,|ui|{for h in ["Время","Задача","Статус","Попытки","Подробности"]{ui.label(RichText::new(h).strong());}ui.end_row();for e in self.activity_log.iter().take(300){ui.label(date(e.at));ui.label(&e.task);ui.label(&e.status);ui.label(e.attempts.to_string());ui.label(&e.details);ui.end_row();}});});});
     }
 
     fn message(&mut self,ui:&mut egui::Ui){if !self.message.is_empty(){card(ui,|ui|{ui.label(RichText::new(&self.message).color(if self.message.starts_with("Ошибка"){Color32::LIGHT_RED}else{Color32::from_rgb(134,239,172)}));});}}
@@ -1317,9 +1365,33 @@ impl eframe::App for PlatiApp {
         if ctx.input(|i|i.modifiers.command&&i.key_pressed(egui::Key::Num5)){self.page=Page::Watchlist;}
         if ctx.input(|i|i.modifiers.command&&i.key_pressed(egui::Key::Num6)){self.page=Page::Activity;}
         self.poll();
-        egui::SidePanel::left("nav").exact_width(225.0).resizable(false).frame(egui::Frame::side_top_panel(&ctx.style()).fill(Color32::from_rgb(15,23,42)).inner_margin(egui::Margin::same(14))).show(ctx,|ui|self.sidebar(ui));
-        egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).fill(Color32::from_rgb(10,15,28)).inner_margin(egui::Margin::symmetric(22,16))).show(ctx,|ui|{
-            self.header(ui);egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|match self.page{Page::Deals=>self.deals_view(ui),Page::Seller=>self.seller_view(ui),Page::Sellers=>self.discover_view(ui),Page::Radar=>self.radar_view(ui),Page::Watchlist=>self.watchlist_view(ui),Page::Activity=>self.activity_view(ui)});
+        let viewport=ctx.input(|i|i.viewport().inner_rect.map(|r|r.size()).unwrap_or(Vec2::new(1280.0,800.0)));
+        let mut responsive_style=(*ctx.style()).clone();
+        if viewport.x<900.0||viewport.y<600.0 {
+            responsive_style.spacing.item_spacing=Vec2::new(6.0,5.0);
+            responsive_style.spacing.button_padding=Vec2::new(7.0,3.0);
+            responsive_style.spacing.interact_size=Vec2::new(30.0,26.0);
+        } else {
+            responsive_style.spacing.item_spacing=if viewport.x>1500.0{Vec2::new(11.0,8.0)}else{Vec2::new(9.0,7.0)};
+            responsive_style.spacing.button_padding=if viewport.x>1500.0{Vec2::new(11.0,6.0)}else{Vec2::new(8.0,4.0)};
+            responsive_style.spacing.interact_size=if viewport.y>900.0{Vec2::new(40.0,32.0)}else{Vec2::new(36.0,29.0)};
+        }
+        let text_scale=if viewport.x<900.0||viewport.y<600.0{0.92}else if viewport.x>1900.0&&viewport.y>1000.0{1.08}else{1.0};
+        for font in responsive_style.text_styles.values_mut(){font.size*=text_scale;}
+        ctx.set_style(responsive_style);
+        let sidebar_width=(viewport.x*0.15).clamp(164.0,240.0);
+        let horizontal_margin=if viewport.x<1000.0{12}else if viewport.x<1300.0{16}else{22};
+        let vertical_margin=if viewport.y<680.0{8}else{16};
+        egui::SidePanel::left("nav").exact_width(sidebar_width).resizable(false).frame(egui::Frame::side_top_panel(&ctx.style()).fill(Color32::from_rgb(15,23,42)).inner_margin(egui::Margin::same(if viewport.x<1000.0{9}else{14}))).show(ctx,|ui|self.sidebar(ui));
+        egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).fill(Color32::from_rgb(10,15,28)).inner_margin(egui::Margin::symmetric(horizontal_margin,vertical_margin))).show(ctx,|ui|{
+            self.header(ui);
+            if self.page==Page::Radar {
+                // Keep the radar table as the only vertical scrolling region on this page.
+                // A parent ScrollArea makes egui chain wheel input into both areas.
+                self.radar_view(ui);
+            } else {
+                egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|match self.page{Page::Deals=>self.deals_view(ui),Page::Seller=>self.seller_view(ui),Page::Sellers=>self.discover_view(ui),Page::Radar=>{},Page::Watchlist=>self.watchlist_view(ui),Page::Activity=>self.activity_view(ui)});
+            }
         });
         if self.note_editor.is_some(){self.note_dialog(ctx);}
         if self.export_draft.is_some(){self.export_dialog(ctx);}
@@ -1465,13 +1537,17 @@ fn sort_deals(a:&ProductDeal,b:&ProductDeal,s:SortMode)->std::cmp::Ordering{matc
 fn opt(x:Option<u64>)->String{x.map(|v|v.to_string()).unwrap_or_else(||"—".into())}
 
 fn theme(ctx:&egui::Context){let mut s=(*ctx.style()).clone();s.visuals=egui::Visuals::dark();s.visuals.panel_fill=Color32::from_rgb(10,15,28);s.visuals.window_fill=Color32::from_rgb(20,29,47);s.visuals.extreme_bg_color=Color32::from_rgb(13,20,35);s.visuals.widgets.inactive.bg_fill=Color32::from_rgb(30,41,59);s.visuals.widgets.hovered.bg_fill=Color32::from_rgb(41,61,82);s.visuals.selection.bg_fill=Color32::from_rgb(3,105,161);s.spacing.item_spacing=Vec2::new(9.0,8.0);ctx.set_style(s);}
-fn card(ui:&mut egui::Ui,f:impl FnOnce(&mut egui::Ui)){egui::Frame::new().fill(Color32::from_rgb(20,29,47)).stroke(Stroke::new(1.0_f32,Color32::from_rgb(37,51,72))).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(13)).show(ui,f);ui.add_space(9.0);}
+fn card(ui:&mut egui::Ui,f:impl FnOnce(&mut egui::Ui)){
+    let content_width=(ui.available_width()-26.0).max(0.0);
+    egui::Frame::new().fill(Color32::from_rgb(20,29,47)).stroke(Stroke::new(1.0_f32,Color32::from_rgb(37,51,72))).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(13)).show(ui,|inner|{if content_width.is_finite(){inner.set_min_width(content_width);}f(inner);});
+    ui.add_space(9.0);
+}
 fn empty(ui:&mut egui::Ui,title:&str,desc:&str){card(ui,|ui|{ui.vertical_centered(|ui|{ui.add_space(26.0);ui.label(RichText::new("◈").size(36.0).color(Color32::from_rgb(56,189,248)));ui.heading(title);ui.label(RichText::new(desc).color(Color32::GRAY));ui.add_space(26.0);});});}
 fn date(ts:u64)->String{let age=unix_now().saturating_sub(ts);if age<3600{format!("{} мин. назад",age/60)}else if age<86_400{format!("{} ч. назад",age/3600)}else{format!("{} дн. назад",age/86_400)}}
 
-fn history_plot(ui:&mut egui::Ui,history:&[NicheHistoryPoint]){
+fn history_plot(ui:&mut egui::Ui,history:&[NicheHistoryPoint],height:f32){
     let history=if history.len()>500{&history[history.len()-500..]}else{history};
-    let (r,p)=ui.allocate_painter(Vec2::new(ui.available_width(),125.0),egui::Sense::hover());let rect=r.rect.shrink(8.0);p.rect_filled(rect,egui::CornerRadius::same(5),Color32::from_rgb(13,20,35));
+    let (r,p)=ui.allocate_painter(Vec2::new(ui.available_width(),height),egui::Sense::hover());let rect=r.rect.shrink(8.0);p.rect_filled(rect,egui::CornerRadius::same(5),Color32::from_rgb(13,20,35));
     if history.is_empty(){p.text(rect.center(),egui::Align2::CENTER_CENTER,"История появится после следующих снимков",egui::FontId::proportional(13.0),Color32::GRAY);return;}
     let max=history.iter().map(|x|x.delta_sales).max().unwrap_or(1).max(1) as f32;let left=rect.left()+15.0;let right=rect.right()-10.0;let top=rect.top()+10.0;let bottom=rect.bottom()-10.0;
     let pts:Vec<_>=history.iter().enumerate().map(|(i,x)|{let xx=if history.len()==1{(left+right)/2.0}else{egui::lerp(left..=right,i as f32/(history.len()-1)as f32)};egui::pos2(xx,egui::lerp(bottom..=top,x.delta_sales as f32/max))}).collect();
@@ -1532,6 +1608,6 @@ pub fn run(out_dir:PathBuf)->Result<()>{
     let mut settings=load_settings(out_dir.clone());
     if explicit_out{settings.out_dir=out_dir;}
     let size=settings.window_size;
-    let options=eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([800.0,560.0]).with_maximized(true).with_icon(Arc::new(app_icon())),..Default::default()};
+    let options=eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([640.0,420.0]).with_maximized(true).with_icon(Arc::new(app_icon())),..Default::default()};
     eframe::run_native("Plati Radar",options,Box::new(move|cc|Ok(Box::new(PlatiApp::new(cc,settings))))).map_err(|e|anyhow::anyhow!("Не удалось запустить Plati Radar: {e}"))
 }
