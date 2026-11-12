@@ -1044,7 +1044,7 @@ impl PlatiApp {
         ui.add_space(25.0);
         ui.label(RichText::new("РАБОЧЕЕ ПРОСТРАНСТВО").small().color(Color32::GRAY));
         ui.add_space(8.0);
-        let pages=if compact {[(Page::Deals,"Поиск"),(Page::Seller,"Продавец"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал / копии")]} else {[(Page::Deals,"Поиск предложений"),(Page::Seller,"Профиль продавца"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар ниш"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал и резервные копии")]};
+        let pages=if compact {[(Page::Deals,"Поиск"),(Page::Seller,"Продавец"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал")]} else {[(Page::Deals,"Поиск предложений"),(Page::Seller,"Профиль продавца"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар ниш"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал и копии")]};
         for (page,label) in pages {
             let selected=self.page==page;
             let (rect,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),34.0),egui::Sense::click());
@@ -1322,7 +1322,7 @@ impl PlatiApp {
         });
         self.message(ui);
         let viewport_height=ui.ctx().input(|i|i.viewport().inner_rect.map(|r|r.height()).unwrap_or(800.0));
-        let chart_height=(viewport_height*0.12).clamp(58.0,120.0);
+        let chart_height=(viewport_height*0.08).clamp(44.0,80.0);
         card(ui,|ui|{ui.label(RichText::new("История изменения продаж").strong());history_plot(ui,&self.history,chart_height);});
         card(ui,|ui|{ui.label(RichText::new("Что изменилось с прошлого снимка").strong());self.snapshot_comparison(ui);});
         ui.horizontal_wrapped(|ui|{
@@ -1356,6 +1356,7 @@ impl PlatiApp {
                 });
                 let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
                 let content_width=widths.iter().sum::<f32>()+6.0*9.0;
+                ui.set_min_width(content_width);
                 egui::ScrollArea::vertical().auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
                     ui.set_min_width(content_width);
                     for row in range {
@@ -1363,16 +1364,24 @@ impl PlatiApp {
                         let Some(product)=current.products.get(m.product_index) else{continue;};
                         let yes=self.favorites.contains(&product.item_id);
                         ui.allocate_ui_with_layout(Vec2::new(content_width,row_height),egui::Layout::left_to_right(egui::Align::Center),|row_ui|{
+                            row_ui.set_min_width(content_width);
+                            let row_rect=row_ui.max_rect();
                             let row_color=if row%2==0{Color32::from_rgb(17,26,45)}else{Color32::from_rgb(20,31,52)};
-                            row_ui.painter().rect_filled(row_ui.max_rect(),4.0,row_color);
+                            row_ui.painter().rect_filled(row_rect,4.0,row_color);
                             row_ui.spacing_mut().item_spacing.x=9.0;
-                            fixed_table_cell(row_ui,widths[0],row_height,|cell|{cell.add_space((row_height-28.0)*0.5);cell.vertical_centered(|cell|{if cell.add_sized([28.0,28.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}});});
-                            fixed_table_cell(row_ui,widths[1],row_height,|cell|{cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());});
-                            fixed_table_cell(row_ui,widths[2],row_height,|cell|{cell.label(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()));});
-                            fixed_table_cell(row_ui,widths[3],row_height,|cell|{cell.label(format!("{:.0} ₽",product.price_rub));});
-                            fixed_table_cell(row_ui,widths[4],row_height,|cell|{cell.label(format!("{} / {}",m.sellers_count,m.listings_count));});
-                            fixed_table_cell(row_ui,widths[5],row_height,|cell|{cell.label(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into()));});
-                            fixed_table_cell(row_ui,widths[6],row_height,|cell|{cell.label(format!("{:.1}",m.opportunity_score));});
+                            if row_ui.add_sized([widths[0],30.0],egui::Button::new(if yes{"★"}else{"☆"})).on_hover_text("Добавить или убрать из избранного").clicked(){toggle_favorite=Some(product.item_id);}
+                            row_ui.add_sized([widths[1],row_height],egui::Hyperlink::from_label_and_url(format!("{}\n{}",product.title,product.category),&product.item_url)).on_hover_text(&product.title);
+                            row_ui.add_sized([widths[2],row_height],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())).wrap());
+                            row_ui.add_sized([widths[3],row_height],egui::Label::new(format!("{:.0} ₽",product.price_rub)).wrap());
+                            row_ui.add_sized([widths[4],row_height],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)).wrap());
+                            row_ui.add_sized([widths[5],row_height],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())).wrap());
+                            row_ui.add_sized([widths[6],row_height],egui::Label::new(format!("{:.1}",m.opportunity_score)).wrap());
+                            let mut boundary=row_rect.left();
+                            for width in widths.iter().take(widths.len()-1){
+                                boundary+=width+9.0;
+                                let x=boundary-13.5;
+                                row_ui.painter().line_segment([egui::pos2(x,row_rect.top()+6.0),egui::pos2(x,row_rect.bottom()-6.0)],Stroke::new(1.0_f32,Color32::from_rgb(37,51,72)));
+                            }
                         });
                     }
                 });
@@ -1439,7 +1448,7 @@ impl PlatiApp {
         let Some(comparison)=&self.radar_comparison else{ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;};
         if comparison.previous_at==0 {ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;}
         ui.label(format!("{} → {} · найдено {} изменений · +{} новых · −{} пропавших",date(comparison.previous_at),date(comparison.current_at),comparison.total_changes,comparison.added,comparison.missing));
-        egui::ScrollArea::vertical().max_height((ui.available_height()*0.22).clamp(72.0,150.0)).show(ui,|ui|{
+        egui::ScrollArea::vertical().max_height((ui.available_height()*0.15).clamp(48.0,100.0)).show(ui,|ui|{
             for change in &comparison.top_changes {
                 ui.horizontal(|ui|{ui.label(RichText::new(&change.detail).strong().color(Color32::from_rgb(125,211,252)));ui.label(&change.title);});
             }
