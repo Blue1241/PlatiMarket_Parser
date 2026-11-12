@@ -2129,6 +2129,7 @@ async fn execute_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.command.is_none() {
@@ -2139,4 +2140,16 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(execute_cli(cli))
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+    let data_dir = app.internal_data_path().to_path_buf();
+    if let Err(error) = native_ui::run_android(data_dir.join("output"), app) {
+        log::error!("Не удалось запустить Plati Radar: {error:#}");
+    }
 }
