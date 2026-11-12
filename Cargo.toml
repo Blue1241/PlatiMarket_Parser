@@ -17,3 +17,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
 eframe = "0.31"
+rfd = "0.15"
+notify-rust = "4.11"

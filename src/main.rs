@@ -47,7 +47,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug, Serialize, Deserialize)]
 enum SortMode {
     RealPrice,
     StorePrice,
@@ -441,6 +441,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     let temp_path = path.with_extension("tmp");
     serde_json::to_writer_pretty(File::create(&temp_path)?, value)?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     fs::rename(temp_path, path)?;
     Ok(())
 }
