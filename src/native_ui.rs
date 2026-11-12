@@ -80,6 +80,14 @@ fn resizable_header_cell(ui:&mut egui::Ui,index:usize,widths:&mut [f32],total_wi
     });
 }
 
+fn fixed_table_cell(ui:&mut egui::Ui,width:f32,height:f32,contents:impl FnOnce(&mut egui::Ui)){
+    ui.allocate_ui_with_layout(Vec2::new(width,height),egui::Layout::top_down(egui::Align::LEFT),|cell|{
+        let rect=cell.max_rect();
+        contents(cell);
+        cell.painter().line_segment([egui::pos2(rect.right(),rect.top()+5.0),egui::pos2(rect.right(),rect.bottom()-5.0)],Stroke::new(1.0_f32,Color32::from_rgb(37,51,72)));
+    });
+}
+
 #[derive(Clone, Default)]
 struct RadarAlertPrefs { enabled: bool, min_delta: i64, max_sellers: usize, text_filter: String, tracked_sellers_only: bool, seller_ids: Vec<u64> }
 
@@ -1146,37 +1154,41 @@ impl PlatiApp {
         });
         card(ui,|ui|{
             let table_width=ui.available_width();
-            let column_budget=(table_width-5.0*12.0).max(240.0);
-            egui::ScrollArea::both().min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
-                egui::Grid::new("deal_rows").striped(true).spacing([12.0,8.0]).min_col_width(56.0).show(ui,|ui|{
-                    resizable_header_cell(ui,0,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Карточка").strong().color(Color32::from_rgb(125,211,252))));});
-                    resizable_header_cell(ui,1,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Тариф").strong().color(Color32::from_rgb(125,211,252))));});
+            // Keep a practical minimum width so columns remain usable in small windows;
+            // the shared horizontal scroll then moves header and rows together.
+            let column_budget=(table_width-5.0*8.0).max(1100.0);
+            egui::ScrollArea::both().auto_shrink([false,false]).min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
+                egui::Grid::new("deal_rows").striped(true).spacing([8.0,6.0]).min_col_width(1.0).show(ui,|ui|{
+                    resizable_header_cell(ui,0,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Карточка").strong().color(Color32::from_rgb(125,211,252))));});
+                    resizable_header_cell(ui,1,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Тариф").strong().color(Color32::from_rgb(125,211,252))));});
                     for (index,(head,mode)) in [("Цена",SortMode::RealPrice),("Отзывы",SortMode::Reviews)].into_iter().enumerate(){
                         let column=index+2;
                         resizable_header_cell(ui,column,&mut self.deal_column_widths,column_budget,|ui,width|{
                             let color=if self.sort==mode{Color32::from_rgb(125,211,252)}else{Color32::WHITE};
-                            if ui.add_sized([width,28.0],egui::Button::new(RichText::new(head).strong().color(color))).clicked(){self.sort=mode;}
+                            if ui.add_sized([width,30.0],egui::Button::new(RichText::new(head).strong().color(color))).clicked(){self.sort=mode;}
                         });
                     }
-                    resizable_header_cell(ui,4,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252))));});
-                    resizable_header_cell(ui,5,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Действия").strong().color(Color32::from_rgb(125,211,252))));});
+                    resizable_header_cell(ui,4,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252))));});
+                    resizable_header_cell(ui,5,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Действия").strong().color(Color32::from_rgb(125,211,252))));});
                     ui.end_row();
+                    let widths=self.deal_column_widths.map(|ratio|ratio*column_budget);
                     let f=self.deals_filter.to_lowercase();
                     let mut rows:Vec<ProductDeal>=self.deals.iter().filter(|d|f.is_empty()||d.title.to_lowercase().contains(&f)||d.seller_name.to_lowercase().contains(&f)).cloned().collect();
                     rows.sort_by(|a,b|sort_deals(a,b,self.sort));
                     for d in rows {
-                        ui.vertical(|ui|{ui.add(egui::Label::new(RichText::new(&d.title).strong()).wrap());ui.hyperlink_to(format!("#{} · открыть ↗",d.item_id),&d.item_url);});
-                        ui.label(RichText::new(&d.matched_tariff).small());
-                        ui.vertical(|ui|{ui.label(RichText::new(format!("{:.0} ₽",d.real_tariff_price_rub)).strong().color(Color32::from_rgb(134,239,172)));if d.price_bait_diff_rub>0.0{ui.label(RichText::new(format!("витрина {:.0} ₽",d.storefront_price_rub)).small().color(Color32::GRAY));}});
-                        ui.vertical(|ui|{ui.label(format!("+{} / -{}",d.positive_reviews,d.negative_reviews));ui.label(RichText::new(format!("негатив {:.1}% · возвраты {}",d.neg_percent,d.returns_count)).small().color(Color32::GRAY));});
-                        ui.vertical(|ui|{ui.label(&d.seller_name);ui.label(RichText::new(format!("рейтинг {:.1} · продаж {}",d.seller_rating,d.sold_count)).small().color(Color32::GRAY));ui.hyperlink_to("Витрина ↗",&d.seller_url);});
-                        ui.vertical(|ui|{
-                            if ui.add_sized([ui.available_width(),24.0],egui::Button::new("Опции и тарифы")).clicked(){self.load_options(&d);}
-                            if ui.add_sized([ui.available_width(),24.0],egui::Button::new(if self.watchlist.iter().any(|w|w.item_id==d.item_id){"★ Отслеживается"}else{"☆ Следить"})).clicked(){self.watch_product(&d);}
-                            if ui.add_sized([ui.available_width(),24.0],egui::Button::new("Анализ продавца")).clicked(){self.seller_url=d.seller_url.clone();self.seller=None;self.page=Page::Seller;}
-                        }); ui.end_row();
+                        fixed_table_cell(ui,widths[0],94.0,|cell|{cell.add(egui::Label::new(RichText::new(&d.title).strong()).wrap());cell.hyperlink_to(format!("#{} · открыть ↗",d.item_id),&d.item_url);});
+                        fixed_table_cell(ui,widths[1],94.0,|cell|{cell.add(egui::Label::new(RichText::new(&d.matched_tariff).small()).wrap());});
+                        fixed_table_cell(ui,widths[2],94.0,|cell|{cell.label(RichText::new(format!("{:.0} ₽",d.real_tariff_price_rub)).strong().color(Color32::from_rgb(134,239,172)));if d.price_bait_diff_rub>0.0{cell.add(egui::Label::new(RichText::new(format!("витрина {:.0} ₽",d.storefront_price_rub)).small().color(Color32::GRAY)).wrap());}});
+                        fixed_table_cell(ui,widths[3],94.0,|cell|{cell.label(format!("+{} / -{}",d.positive_reviews,d.negative_reviews));cell.add(egui::Label::new(RichText::new(format!("негатив {:.1}% · возвраты {}",d.neg_percent,d.returns_count)).small().color(Color32::GRAY)).wrap());});
+                        fixed_table_cell(ui,widths[4],94.0,|cell|{cell.add(egui::Label::new(&d.seller_name).wrap());cell.add(egui::Label::new(RichText::new(format!("рейтинг {:.1} · продаж {}",d.seller_rating,d.sold_count)).small().color(Color32::GRAY)).wrap());cell.hyperlink_to("Витрина ↗",&d.seller_url);});
+                        fixed_table_cell(ui,widths[5],94.0,|cell|{
+                            if cell.add_sized([cell.available_width(),25.0],egui::Button::new("Опции и тарифы")).clicked(){self.load_options(&d);}
+                            if cell.add_sized([cell.available_width(),25.0],egui::Button::new(if self.watchlist.iter().any(|w|w.item_id==d.item_id){"★ Отслеживается"}else{"☆ Следить"})).clicked(){self.watch_product(&d);}
+                            if cell.add_sized([cell.available_width(),25.0],egui::Button::new("Анализ продавца")).clicked(){self.seller_url=d.seller_url.clone();self.seller=None;self.page=Page::Seller;}
+                        });
+                        ui.end_row();
                     }
-                    if self.deals.is_empty(){ui.label(RichText::new("Запустите поиск, чтобы увидеть предложения.").color(Color32::GRAY));ui.end_row();}
+                    if self.deals.is_empty(){ui.add(egui::Label::new(RichText::new("Запустите поиск, чтобы увидеть предложения.").color(Color32::GRAY)).wrap());ui.end_row();}
                 });
             });
         });
@@ -1245,27 +1257,40 @@ impl PlatiApp {
             if self.discover_busy { if self.discover_progress.1>0 { let f=self.discover_progress.0 as f32/self.discover_progress.1 as f32;ui.add(egui::ProgressBar::new(f).show_percentage().text(format!("{} / {} категорий",self.discover_progress.0,self.discover_progress.1))); } ui.label(&self.discover_progress.2); }
         }); self.message(ui);
         ui.horizontal_wrapped(|ui|{ui.heading("Продавцы");ui.label(RichText::new(format!("{} записей",self.sellers.len())).color(Color32::GRAY));ui.label(RichText::new("↔ тяните разделители заголовков").small().color(Color32::GRAY));ui.add(egui::TextEdit::singleline(&mut self.sellers_filter).desired_width((ui.available_width()*0.24).clamp(130.0,240.0)).hint_text("Фильтр"));if ui.small_button("Сбросить ширину столбцов").clicked(){self.seller_column_widths=default_seller_column_widths();}if ui.button("Экспорт / настроить…").clicked(){let f=self.sellers_filter.to_lowercase();let rows:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();self.prepare_export("Продавцы","sellers",&rows);}});
-        card(ui,|ui|{let table_width=ui.available_width();let column_budget=(table_width-5.0*16.0).max(240.0);let seller_list_height=(ui.available_height()-150.0).clamp(180.0,720.0);egui::ScrollArea::both().max_height(seller_list_height).show(ui,|ui|{
-            egui::Grid::new("seller_list").striped(true).spacing([16.0,7.0]).min_col_width(56.0).show(ui,|ui|{
-                resizable_header_cell(ui,0,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252))));});
-                for (index,(title,sort)) in [("Рейтинг",SellerSort::Rating),("Продажи",SellerSort::Sales),("Отзывы",SellerSort::Reviews)].into_iter().enumerate(){
-                    let column=index+1;
-                    resizable_header_cell(ui,column,&mut self.seller_column_widths,column_budget,|ui,width|{
-                        let color=if self.seller_sort==sort{Color32::from_rgb(125,211,252)}else{Color32::WHITE};
-                        if ui.add_sized([width,28.0],egui::Button::new(RichText::new(title).strong().color(color))).clicked(){self.seller_sort=sort;}
-                    });
-                }
-                resizable_header_cell(ui,4,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Возвраты").strong().color(Color32::from_rgb(125,211,252))));});
-                resizable_header_cell(ui,5,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new("Профиль").strong().color(Color32::from_rgb(125,211,252))));});
-                ui.end_row();
-                let f=self.sellers_filter.to_lowercase();
-                let mut records:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();
-                records.sort_by(|a,b|match self.seller_sort{SellerSort::Rating=>b.rating.unwrap_or(0.0).partial_cmp(&a.rating.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),SellerSort::Sales=>b.sales_count.cmp(&a.sales_count),SellerSort::Reviews=>b.reviews_count.cmp(&a.reviews_count)});
-                for s in &records{
-                    ui.label(RichText::new(&s.seller_name).strong());ui.label(format!("{:.1}",s.rating.unwrap_or(0.0)));ui.label(opt(s.sales_count));ui.label(opt(s.reviews_count));ui.label(opt(s.returns_count));ui.hyperlink_to("Открыть ↗",&s.profile_url);ui.end_row();
-                }
+        card(ui,|ui|{
+            let table_width=ui.available_width();
+            let column_budget=(table_width-5.0*8.0).max(860.0);
+            let seller_list_height=(ui.available_height()-150.0).clamp(180.0,720.0);
+            egui::ScrollArea::both().auto_shrink([false,false]).max_height(seller_list_height).show(ui,|ui|{
+                egui::Grid::new("seller_list").striped(true).spacing([8.0,6.0]).min_col_width(1.0).show(ui,|ui|{
+                    resizable_header_cell(ui,0,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252))));});
+                    for (index,(title,sort)) in [("Рейтинг",SellerSort::Rating),("Продажи",SellerSort::Sales),("Отзывы",SellerSort::Reviews)].into_iter().enumerate(){
+                        let column=index+1;
+                        resizable_header_cell(ui,column,&mut self.seller_column_widths,column_budget,|ui,width|{
+                            let color=if self.seller_sort==sort{Color32::from_rgb(125,211,252)}else{Color32::WHITE};
+                            if ui.add_sized([width,30.0],egui::Button::new(RichText::new(title).strong().color(color))).clicked(){self.seller_sort=sort;}
+                        });
+                    }
+                    resizable_header_cell(ui,4,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Возвраты").strong().color(Color32::from_rgb(125,211,252))));});
+                    resizable_header_cell(ui,5,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Профиль").strong().color(Color32::from_rgb(125,211,252))));});
+                    ui.end_row();
+                    let widths=self.seller_column_widths.map(|ratio|ratio*column_budget);
+                    let f=self.sellers_filter.to_lowercase();
+                    let mut records:Vec<SellerRecord>=self.sellers.iter().filter(|s|f.is_empty()||s.seller_name.to_lowercase().contains(&f)||s.seller_id.to_string().contains(&f)).cloned().collect();
+                    records.sort_by(|a,b|match self.seller_sort{SellerSort::Rating=>b.rating.unwrap_or(0.0).partial_cmp(&a.rating.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),SellerSort::Sales=>b.sales_count.cmp(&a.sales_count),SellerSort::Reviews=>b.reviews_count.cmp(&a.reviews_count)});
+                    for seller in &records{
+                        fixed_table_cell(ui,widths[0],52.0,|cell|{cell.add(egui::Label::new(RichText::new(&seller.seller_name).strong()).wrap());});
+                        fixed_table_cell(ui,widths[1],52.0,|cell|{cell.label(format!("{:.1}",seller.rating.unwrap_or(0.0)));});
+                        fixed_table_cell(ui,widths[2],52.0,|cell|{cell.label(opt(seller.sales_count));});
+                        fixed_table_cell(ui,widths[3],52.0,|cell|{cell.label(opt(seller.reviews_count));});
+                        fixed_table_cell(ui,widths[4],52.0,|cell|{cell.label(opt(seller.returns_count));});
+                        fixed_table_cell(ui,widths[5],52.0,|cell|{cell.hyperlink_to("Открыть ↗",&seller.profile_url);});
+                        ui.end_row();
+                    }
+                    if records.is_empty(){ui.add(egui::Label::new(RichText::new("Продавцы не найдены.").color(Color32::GRAY)).wrap());ui.end_row();}
+                });
             });
-        });});
+        });
     }
 
     fn radar_view(&mut self,ui:&mut egui::Ui){
@@ -1304,40 +1329,41 @@ impl PlatiApp {
             ui.horizontal(|ui|{ui.label(RichText::new(format!("Возможности · {}{}",self.radar_visible.len(),if self.radar_visible.len()==2000{"+"}else{""})).strong());if self.radar_derived_loading||self.radar_visible_loading{ui.spinner();ui.label("Подготовка данных в фоне…");}else if self.radar_metrics.is_empty(){ui.label("Нет данных радара");}});
             if self.radar_derived_loading||self.radar_visible_loading {return;}
             let Some(current)=self.snapshots.first() else{return;};
-            let table_width=ui.available_width();let compact_rows=table_width<900.0;
-            let column_budget=(table_width-6.0*9.0).max(240.0);
-            ui.horizontal(|ui|{
-                let labels=if compact_rows{["★","Карточка","Δ","Цена","Продавцы","Наценка","Балл"]}else{["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"]};
-                for (index,label) in labels.into_iter().enumerate(){
-                    resizable_header_cell(ui,index,&mut self.radar_column_widths,column_budget,|ui,width|{ui.add_sized([width,28.0],egui::Label::new(RichText::new(label).strong().color(Color32::from_rgb(125,211,252))));});
-                }
-            });
+            let table_width=ui.available_width();
+            let column_budget=(table_width-6.0*9.0).max(1100.0);
+            let labels=["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"];
             let mut toggle_favorite=None;
-            let row_height=if compact_rows{78.0}else{58.0};
-            let table_height=ui.available_height().clamp(120.0,900.0);
-            egui::ScrollArea::both().min_scrolled_height(table_height).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
-                for row in range {
-                    let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
-                    let Some(product)=current.products.get(m.product_index) else{continue;};
-                    let yes=self.favorites.contains(&product.item_id);
-                    let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
-                    if compact_rows {
-                        ui.allocate_ui_with_layout(egui::vec2(table_width,row_height-4.0),egui::Layout::top_down(egui::Align::LEFT),|row_ui|{
-                            row_ui.horizontal(|row_ui|{if row_ui.add_sized([widths[0],24.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}row_ui.add_sized([widths[1],24.0],egui::Label::new(egui::RichText::new(&product.title)).wrap());});
-                            row_ui.horizontal_wrapped(|row_ui|{row_ui.add_sized([widths[2],22.0],egui::Label::new(format!("Δ {}",m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()))));row_ui.add_sized([widths[3],22.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));row_ui.add_sized([widths[4],22.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));row_ui.add_sized([widths[5],22.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));row_ui.add_sized([widths[6],22.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));});
-                        });
-                    } else {
-                        ui.horizontal(|ui|{
-                            if ui.add_sized([widths[0],28.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}
-                            ui.allocate_ui_with_layout(egui::vec2(widths[1],56.0),egui::Layout::top_down(egui::Align::LEFT),|ui|{ui.hyperlink_to(&product.title,&product.item_url);ui.label(RichText::new(&product.category).small().color(Color32::GRAY));});
-                            ui.add_sized([widths[2],24.0],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())));
-                            ui.add_sized([widths[3],24.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));
-                            ui.add_sized([widths[4],24.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));
-                            ui.add_sized([widths[5],24.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));
-                            ui.add_sized([widths[6],24.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));
+            let row_height=68.0;
+            let table_height=(ui.available_height()-36.0).clamp(120.0,900.0);
+            // One horizontal viewport wraps both header and body; vertical scrolling is
+            // confined to the rows so column edges stay aligned while scrolling sideways.
+            egui::ScrollArea::horizontal().auto_shrink([false,false]).show(ui,|ui|{
+                ui.horizontal(|ui|{
+                    ui.spacing_mut().item_spacing.x=9.0;
+                    for (index,label) in labels.into_iter().enumerate(){
+                        resizable_header_cell(ui,index,&mut self.radar_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new(label).strong().color(Color32::from_rgb(125,211,252))));});
+                    }
+                });
+                let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
+                egui::ScrollArea::vertical().auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
+                    for row in range {
+                        let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
+                        let Some(product)=current.products.get(m.product_index) else{continue;};
+                        let yes=self.favorites.contains(&product.item_id);
+                        ui.allocate_ui_with_layout(Vec2::new(widths.iter().sum::<f32>()+6.0*9.0,row_height),egui::Layout::left_to_right(egui::Align::Center),|row_ui|{
+                            let row_color=if row%2==0{Color32::from_rgb(17,26,45)}else{Color32::from_rgb(20,31,52)};
+                            row_ui.painter().rect_filled(row_ui.max_rect(),4.0,row_color);
+                            row_ui.spacing_mut().item_spacing.x=9.0;
+                            fixed_table_cell(row_ui,widths[0],row_height,|cell|{cell.centered_and_justified(|cell|{if cell.add(egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}});});
+                            fixed_table_cell(row_ui,widths[1],row_height,|cell|{cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());});
+                            fixed_table_cell(row_ui,widths[2],row_height,|cell|{cell.label(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()));});
+                            fixed_table_cell(row_ui,widths[3],row_height,|cell|{cell.label(format!("{:.0} ₽",product.price_rub));});
+                            fixed_table_cell(row_ui,widths[4],row_height,|cell|{cell.label(format!("{} / {}",m.sellers_count,m.listings_count));});
+                            fixed_table_cell(row_ui,widths[5],row_height,|cell|{cell.label(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into()));});
+                            fixed_table_cell(row_ui,widths[6],row_height,|cell|{cell.label(format!("{:.1}",m.opportunity_score));});
                         });
                     }
-                }
+                });
             });
             if let Some(id)=toggle_favorite{if self.favorites.remove(&id)==false{self.favorites.insert(id);}let _=write_json_atomic(&self.out_dir.join("niche_favorites.json"),&self.favorites);self.radar_filter_key.clear();}
             if self.snapshots.len()<2{ui.label(RichText::new("Для сравнения нужны два снимка; первый запускается автоматически.").small().color(Color32::GRAY));}
