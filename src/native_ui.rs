@@ -1369,7 +1369,11 @@ impl PlatiApp {
                             row_ui.painter().rect_filled(row_rect,4.0,row_color);
                             row_ui.spacing_mut().item_spacing.x=9.0;
                             if row_ui.add_sized([widths[0],30.0],egui::Button::new(if yes{"★"}else{"☆"})).on_hover_text("Добавить или убрать из избранного").clicked(){toggle_favorite=Some(product.item_id);}
-                            row_ui.add_sized([widths[1],row_height],egui::Hyperlink::from_label_and_url(format!("{}\n{}",product.title,product.category),&product.item_url)).on_hover_text(&product.title);
+                            row_ui.allocate_ui_with_layout(Vec2::new(widths[1],row_height),egui::Layout::top_down(egui::Align::LEFT),|cell|{
+                                cell.set_min_width(widths[1]);
+                                cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);
+                                cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());
+                            });
                             row_ui.add_sized([widths[2],row_height],egui::Label::new(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into())).wrap());
                             row_ui.add_sized([widths[3],row_height],egui::Label::new(format!("{:.0} ₽",product.price_rub)).wrap());
                             row_ui.add_sized([widths[4],row_height],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)).wrap());
@@ -1447,9 +1451,12 @@ impl PlatiApp {
         let Some(comparison)=&self.radar_comparison else{ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;};
         if comparison.previous_at==0 {ui.label(RichText::new("Сравнение появится после второго снимка радара.").small().color(Color32::GRAY));return;}
         ui.label(format!("{} → {} · найдено {} изменений · +{} новых · −{} пропавших",date(comparison.previous_at),date(comparison.current_at),comparison.total_changes,comparison.added,comparison.missing));
-        egui::ScrollArea::vertical().max_height((ui.available_height()*0.15).clamp(48.0,100.0)).show(ui,|ui|{
+        egui::ScrollArea::vertical().id_salt("radar_comparison_changes").max_height((ui.available_height()*0.15).clamp(48.0,100.0)).show(ui,|ui|{
             for change in &comparison.top_changes {
-                ui.horizontal(|ui|{ui.label(RichText::new(&change.detail).strong().color(Color32::from_rgb(125,211,252)));ui.label(&change.title);});
+                ui.horizontal_wrapped(|ui|{
+                    ui.label(RichText::new(&change.detail).strong().color(Color32::from_rgb(125,211,252)));
+                    ui.add(egui::Label::new(&change.title).wrap());
+                });
             }
             if comparison.total_changes>comparison.top_changes.len(){ui.label(RichText::new(format!("Показаны наиболее заметные {} из {} изменений",comparison.top_changes.len(),comparison.total_changes)).small().color(Color32::GRAY));}
         });
