@@ -31,10 +31,12 @@ const DIGISELLER_PRODUCT_API: &str = "https://api.digiseller.com/api/products";
 
 const WEB_UI_HTML: &str = include_str!("ui.html");
 
+mod native_ui;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "plati_rust_parser",
-    about = "Веб-интерфейс и парсер выгодных карточек и продавцов Plati.Market"
+    about = "Нативное приложение, веб-интерфейс и парсер выгодных карточек и продавцов Plati.Market"
 )]
 struct Cli {
     /// Папка для сохранения отчётов (JSON, CSV)
@@ -55,7 +57,7 @@ enum SortMode {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Запустить удобный локальный веб-интерфейс (режим по умолчанию)
+    /// Запустить дополнительный локальный веб-интерфейс
     Serve {
         /// Порт веб-сервера
         #[arg(short, long, default_value_t = 8080)]
@@ -94,10 +96,6 @@ enum Commands {
         #[arg(short, long, default_value = DEFAULT_SELLER_URL)]
         url: String,
     },
-
-    #[cfg(feature = "desktop")]
-    /// Запустить приложение в отдельном нативном окне
-    Desktop,
 
     /// Собрать базу активных продавцов через cats.xml + Public API (CLI)
     Discover {
@@ -1963,49 +1961,6 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "desktop")]
-fn run_desktop(out_dir: PathBuf) -> Result<()> {
-    use std::sync::mpsc;
-    use tauri::WebviewUrl;
-
-    let (url_tx, url_rx) = mpsc::sync_channel::<String>(1);
-    std::thread::Builder::new()
-        .name("plati-radar-server".into())
-        .spawn(move || -> Result<()> {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(async move {
-                let client = build_client()?;
-                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
-                let address = listener.local_addr()?;
-                let app = prepare_web_app(client, out_dir).await?;
-                url_tx.send(format!("http://{address}/"))
-                    .map_err(|_| anyhow::anyhow!("Окно приложения не запустилось"))?;
-                axum::serve(listener, app).await?;
-                Ok(())
-            })
-        })
-        .context("Не удалось запустить локальный сервер")?;
-
-    tauri::Builder::default()
-        .setup(move |app| {
-            let url = url_rx.recv_timeout(Duration::from_secs(30))?;
-            tauri::WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::External(url.parse()?),
-            )
-            .title("Plati Radar")
-            .inner_size(1440.0, 960.0)
-            .min_inner_size(900.0, 620.0)
-            .build()?;
-            Ok(())
-        })
-        .run(tauri::generate_context!())
-        .context("Не удалось запустить нативное окно")?;
-    Ok(())
-}
 
 // ======================= MAIN =======================
 
@@ -2016,9 +1971,6 @@ async fn execute_cli(cli: Cli) -> Result<()> {
         Commands::Serve { port } => {
             run_web_server(client, cli.out_dir, port).await?;
         }
-
-        #[cfg(feature = "desktop")]
-        Commands::Desktop => anyhow::bail!("desktop должен запускаться из главной точки входа"),
 
         Commands::Deals {
             query,
@@ -2127,17 +2079,10 @@ async fn execute_cli(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "desktop"))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    execute_cli(Cli::parse()).await
-}
-
-#[cfg(feature = "desktop")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(&cli.command, None | Some(Commands::Desktop)) {
-        return run_desktop(cli.out_dir);
+    if cli.command.is_none() {
+        return native_ui::run(cli.out_dir);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
