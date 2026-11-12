@@ -8,6 +8,7 @@
 
 - [Требования](#требования)
 - [Запуск приложения](#запуск-приложения)
+- [Сборка для Android](#сборка-для-android)
 - [Возможности приложения](#возможности-приложения)
 - [Радар ниш: сбор и интерпретация данных](#радар-ниш-сбор-и-интерпретация-данных)
 - [CLI-команды](#cli-команды)
@@ -62,6 +63,30 @@ cargo run -- deals --help
 ```bash
 cargo run --release -- --out-dir ./radar-data serve --port 8080
 ```
+
+## Сборка для Android
+
+Приложение использует нативный `egui/eframe` через Android `NativeActivity` — WebView не используется. Поддерживается ARM64 (`aarch64-linux-android`), минимальная версия Android — API 23. Сборка APK выполняется через `cargo-apk`.
+
+### Инструменты
+
+- Rust stable и Cargo (`rustup`), с target `aarch64-linux-android`.
+- Android SDK Platform Tools (`adb`) и Android NDK; задайте `ANDROID_HOME`/`ANDROID_SDK_ROOT` и `ANDROID_NDK_HOME` согласно установке SDK.
+- JDK для инструментов Android SDK.
+- `cargo-apk`: `cargo install cargo-apk`.
+
+### Команды (Linux/macOS)
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-apk
+cargo apk build
+find target -type f -name '*.apk' -print
+```
+
+Первый запуск cargo-apk может потребовать принять лицензию Android SDK (`sdkmanager --licenses`). `cargo apk build` собирает development APK для локальной установки и тестирования. Для публикации настройте отдельную release-подпись согласно документации cargo-apk и требованиям целевой площадки; файл keystore и пароли не следует добавлять в репозиторий. Установить на подключённое устройство можно командой `adb install -r <путь-к-apk>`. Сборку также можно запустить скриптом `./scripts/build-android.sh` (дополнительные аргументы передаются cargo-apk).
+
+На Android настройки и результаты хранятся во внутреннем каталоге приложения (`files/`), поэтому они не доступны другим приложениям напрямую. Экспорт CSV/XLSX/JSON без системного диалога записывается в каталог данных приложения; выбор внешней папки, резервное копирование/восстановление через системный picker, открытие каталога во внешнем файловом менеджере и системные уведомления пока недоступны. Android-сборка ещё не проверена на устройстве в этой среде.
 
 ## Возможности приложения
 

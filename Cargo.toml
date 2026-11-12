@@ -4,6 +4,10 @@ version = "0.2.0"
 edition = "2021"
 description = "Нативное приложение и парсер карточек и продавцов Plati.Market на Rust"
 
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
@@ -11,12 +15,31 @@ clap = { version = "4.5", features = ["derive"] }
 csv = "1.3"
 futures = "0.3"
 regex = "1.11"
-reqwest = { version = "0.12", features = ["json", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls-webpki-roots"] }
 scraper = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["android-native-activity"] }
+rust_xlsxwriter = "0.90"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.15"
 notify-rust = "4.11"
-rust_xlsxwriter = "0.90"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+log = "0.4"
+winit = "0.30"
+
+[package.metadata.android]
+package = "ru.blue1241.platiradar"
+apk_name = "PlatiRadar"
+build_targets = ["aarch64-linux-android"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[package.metadata.android.sdk]
+min_sdk_version = 23
+target_sdk_version = 35

@@ -188,12 +188,47 @@ impl UiSettings {
     }
 }
 
+#[cfg(target_os = "android")]
+static ANDROID_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(not(target_os = "android"))]
+fn pick_folder_dialog(start: &Path) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_directory(start).pick_folder()
+}
+
+#[cfg(target_os = "android")]
+fn pick_folder_dialog(_start: &Path) -> Option<PathBuf> { None }
+
+#[cfg(not(target_os = "android"))]
+fn save_file_dialog(directory: &Path, filename: &str, filter: &str, extension: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_directory(directory)
+        .set_file_name(filename)
+        .add_filter(filter, &[extension])
+        .save_file()
+}
+
+#[cfg(target_os = "android")]
+fn save_file_dialog(directory: &Path, filename: &str, _filter: &str, _extension: &str) -> Option<PathBuf> {
+    Some(directory.join(filename))
+}
+
+#[cfg(not(target_os = "android"))]
+fn send_notification(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new().summary(title).body(body).show();
+}
+
+#[cfg(target_os = "android")]
+fn send_notification(_title: &str, _body: &str) {}
+
 fn settings_file() -> PathBuf {
+    #[cfg(target_os = "android")]
+    let base = ANDROID_DATA_DIR.get().cloned();
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(target_os="macos")]
     let base = std::env::var_os("HOME").map(|h|PathBuf::from(h).join("Library").join("Application Support"));
-    #[cfg(all(not(windows),not(target_os="macos")))]
+    #[cfg(all(not(windows),not(target_os="macos"),not(target_os="android")))]
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
     base.unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("output"))
         .join("PlatiRadar").join("settings.json")
@@ -539,7 +574,7 @@ impl PlatiApp {
         if !alerts.is_empty() {
             let body=alerts.iter().take(3).cloned().collect::<Vec<_>>().join("\n");
             self.record_task("Отслеживание","Оповещение",format!("{} изменений",alerts.len()));
-            self.runtime.spawn_blocking(move||{let _=notify_rust::Notification::new().summary("Plati Radar · отслеживание").body(&body).show();});
+            self.runtime.spawn_blocking(move||{send_notification("Plati Radar · отслеживание", &body);});
         }
     }
 
@@ -555,7 +590,7 @@ impl PlatiApp {
     }
 
     fn backup_data(&mut self) {
-        if let Some(destination)=rfd::FileDialog::new().set_directory(&self.out_dir).pick_folder() {
+        if let Some(destination)=pick_folder_dialog(&self.out_dir) {
             if destination==self.out_dir || destination.starts_with(&self.out_dir) {
                 self.backup_message="Выберите папку за пределами каталога данных".into(); return;
             }
@@ -571,7 +606,7 @@ impl PlatiApp {
     }
 
     fn choose_restore(&mut self) {
-        if let Some(path)=rfd::FileDialog::new().set_directory(&self.out_dir).pick_folder() {
+        if let Some(path)=pick_folder_dialog(&self.out_dir) {
             if path==self.out_dir || path.starts_with(&self.out_dir) { self.backup_message="Выберите резервную копию вне текущего каталога данных".into(); }
             else if path.join("manifest.json").exists() { self.restore_candidate=Some(path); }
             else { self.backup_message="В выбранной папке не найден manifest.json резервной копии".into(); }
@@ -954,7 +989,7 @@ impl PlatiApp {
     }
 
     fn choose_output_dir(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().set_directory(&self.out_dir).pick_folder() {
+        if let Some(path) = pick_folder_dialog(&self.out_dir) {
             self.out_dir = path;
             if let Ok(mut shared) = self.output_shared.write() { *shared = self.out_dir.clone(); }
             self.deals = read_json_or(self.out_dir.join("deals.json"), Vec::new());
@@ -1027,7 +1062,7 @@ impl PlatiApp {
             let columns:Vec<String>=draft.columns.iter().filter(|c|draft.selected.contains(*c)).cloned().collect();
             let filename=format!("{}.{}",draft.filename,format.extension());
             let filter=match format{ExportFormat::Csv=>"CSV",ExportFormat::Xlsx=>"Excel",ExportFormat::Json=>"JSON"};
-            if let Some(path)=rfd::FileDialog::new().set_file_name(&filename).add_filter(filter,&[format.extension()]).save_file(){
+            if let Some(path)=save_file_dialog(&self.out_dir, &filename, filter, format.extension()){
                 self.message=write_custom_export(&path,&columns,&draft.rows,format).map(|_|format!("Экспортировано: {}",path.display())).unwrap_or_else(|e|format!("Ошибка экспорта: {e}"));
                 return;
             }
@@ -1544,7 +1579,7 @@ fn start_capture(client:Client,out:PathBuf,tx:Sender<UiMessage>,running:Arc<Atom
             let count=build_niche_trends(&snapshots).iter().filter(|t|matches_alert_target(&prefs,&t.product.title,&t.product.category,t.product.seller_id)&&t.delta_sales.unwrap_or(i64::MIN)>=prefs.min_delta&&t.sellers_count<=prefs.max_sellers).count();
             if count>0 {
                 let body=format!("По текущим порогам найдено {count} возможностей");
-                let _=tokio::task::spawn_blocking(move||{let _=notify_rust::Notification::new().summary("Plati Radar").body(&body).show();}).await;
+                let _=tokio::task::spawn_blocking(move||{send_notification("Plati Radar", &body);}).await;
             }
         }
         running.store(false,Ordering::Release);
@@ -1735,8 +1770,10 @@ fn open_folder(path:&Path)->Result<()> {
     std::process::Command::new("explorer").arg(path).spawn()?;
     #[cfg(target_os="macos")]
     std::process::Command::new("open").arg(path).spawn()?;
-    #[cfg(all(unix,not(target_os="macos")))]
+    #[cfg(all(unix,not(target_os="macos"),not(target_os="android")))]
     std::process::Command::new("xdg-open").arg(path).spawn()?;
+    #[cfg(target_os="android")]
+    anyhow::bail!("Открытие каталога через системный проводник пока недоступно на Android");
     Ok(())
 }
 
@@ -1755,11 +1792,40 @@ fn app_icon()->egui::IconData {
     egui::IconData{rgba,width:w,height:h}
 }
 
-pub fn run(out_dir:PathBuf)->Result<()>{
-    let explicit_out=std::env::args().any(|a|a=="--out-dir"||a=="-o");
-    let mut settings=load_settings(out_dir.clone());
-    if explicit_out{settings.out_dir=out_dir;}
-    let size=settings.window_size;
-    let options=eframe::NativeOptions{viewport:egui::ViewportBuilder::default().with_inner_size(size).with_min_inner_size([640.0,420.0]).with_maximized(true).with_icon(Arc::new(app_icon())),..Default::default()};
-    eframe::run_native("Plati Radar",options,Box::new(move|cc|Ok(Box::new(PlatiApp::new(cc,settings))))).map_err(|e|anyhow::anyhow!("Не удалось запустить Plati Radar: {e}"))
+#[cfg(not(target_os = "android"))]
+pub fn run(out_dir: PathBuf) -> Result<()> {
+    let explicit_out = std::env::args().any(|a| a == "--out-dir" || a == "-o");
+    let mut settings = load_settings(out_dir.clone());
+    if explicit_out {
+        settings.out_dir = out_dir;
+    }
+    let size = settings.window_size;
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(size)
+            .with_min_inner_size([640.0, 420.0])
+            .with_maximized(true)
+            .with_icon(Arc::new(app_icon())),
+        ..Default::default()
+    };
+    eframe::run_native("Plati Radar", options, Box::new(move |cc| Ok(Box::new(PlatiApp::new(cc, settings)))))
+        .map_err(|e| anyhow::anyhow!("Не удалось запустить Plati Radar: {e}"))
+}
+
+#[cfg(target_os = "android")]
+pub fn run_android(
+    out_dir: PathBuf,
+    app: winit::platform::android::activity::AndroidApp,
+) -> Result<()> {
+    let data_dir = app.internal_data_path().to_path_buf();
+    let _ = ANDROID_DATA_DIR.set(data_dir);
+    let mut settings = load_settings(out_dir.clone());
+    settings.out_dir = out_dir;
+    let options = eframe::NativeOptions {
+        android_app: Some(app),
+        viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 700.0]),
+        ..Default::default()
+    };
+    eframe::run_native("Plati Radar", options, Box::new(move |cc| Ok(Box::new(PlatiApp::new(cc, settings)))))
+        .map_err(|e| anyhow::anyhow!("Не удалось запустить Plati Radar: {e}"))
 }
