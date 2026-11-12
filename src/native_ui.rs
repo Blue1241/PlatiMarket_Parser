@@ -1044,8 +1044,18 @@ impl PlatiApp {
         ui.add_space(25.0);
         ui.label(RichText::new("РАБОЧЕЕ ПРОСТРАНСТВО").small().color(Color32::GRAY));
         ui.add_space(8.0);
-        let pages=if compact {[(Page::Deals,"⌕  Поиск"),(Page::Seller,"◉  Продавец"),(Page::Sellers,"▤  База продавцов"),(Page::Radar,"◌  Радар"),(Page::Watchlist,"★  Отслеживание"),(Page::Activity,"≡  Журнал / копии")]} else {[(Page::Deals,"⌕  Поиск предложений"),(Page::Seller,"◉  Профиль продавца"),(Page::Sellers,"▤  База продавцов"),(Page::Radar,"◌  Радар ниш"),(Page::Watchlist,"★  Отслеживание"),(Page::Activity,"≡  Журнал и резервные копии")]};
-        for (page,label) in pages {if ui.selectable_label(self.page==page,label).clicked(){self.page=page;}}
+        let pages=if compact {[(Page::Deals,"Поиск"),(Page::Seller,"Продавец"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал / копии")]} else {[(Page::Deals,"Поиск предложений"),(Page::Seller,"Профиль продавца"),(Page::Sellers,"База продавцов"),(Page::Radar,"Радар ниш"),(Page::Watchlist,"Отслеживание"),(Page::Activity,"Журнал и резервные копии")]};
+        for (page,label) in pages {
+            let selected=self.page==page;
+            let (rect,response)=ui.allocate_exact_size(Vec2::new(ui.available_width(),34.0),egui::Sense::click());
+            if response.clicked(){self.page=page;}
+            let fill=if selected{Color32::from_rgb(3,105,161)}else if response.hovered(){Color32::from_rgb(41,61,82)}else{Color32::TRANSPARENT};
+            ui.painter().rect_filled(rect,egui::CornerRadius::same(4),fill);
+            let color=if selected{Color32::WHITE}else{Color32::from_rgb(203,213,225)};
+            paint_sidebar_icon(ui.painter(),egui::pos2(rect.left()+19.0,rect.center().y),page,if page==Page::Watchlist{Color32::from_rgb(251,191,36)}else{color});
+            ui.painter().text(egui::pos2(rect.left()+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(14.0),color);
+            ui.add_space(3.0);
+        }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.separator();
             if ui.add_sized([ui.available_width(),26.0],egui::Button::new(if compact{"Открыть папку"}else{"Открыть папку данных"})).clicked(){self.open_output_dir();}
@@ -1345,16 +1355,18 @@ impl PlatiApp {
                     }
                 });
                 let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
+                let content_width=widths.iter().sum::<f32>()+6.0*9.0;
                 egui::ScrollArea::vertical().auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
+                    ui.set_min_width(content_width);
                     for row in range {
                         let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
                         let Some(product)=current.products.get(m.product_index) else{continue;};
                         let yes=self.favorites.contains(&product.item_id);
-                        ui.allocate_ui_with_layout(Vec2::new(widths.iter().sum::<f32>()+6.0*9.0,row_height),egui::Layout::left_to_right(egui::Align::Center),|row_ui|{
+                        ui.allocate_ui_with_layout(Vec2::new(content_width,row_height),egui::Layout::left_to_right(egui::Align::Center),|row_ui|{
                             let row_color=if row%2==0{Color32::from_rgb(17,26,45)}else{Color32::from_rgb(20,31,52)};
                             row_ui.painter().rect_filled(row_ui.max_rect(),4.0,row_color);
                             row_ui.spacing_mut().item_spacing.x=9.0;
-                            fixed_table_cell(row_ui,widths[0],row_height,|cell|{cell.centered_and_justified(|cell|{if cell.add(egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}});});
+                            fixed_table_cell(row_ui,widths[0],row_height,|cell|{cell.add_space((row_height-28.0)*0.5);cell.vertical_centered(|cell|{if cell.add_sized([28.0,28.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}});});
                             fixed_table_cell(row_ui,widths[1],row_height,|cell|{cell.hyperlink_to(&product.title,&product.item_url).on_hover_text(&product.title);cell.add(egui::Label::new(RichText::new(&product.category).small().color(Color32::GRAY)).wrap());});
                             fixed_table_cell(row_ui,widths[2],row_height,|cell|{cell.label(m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()));});
                             fixed_table_cell(row_ui,widths[3],row_height,|cell|{cell.label(format!("{:.0} ₽",product.price_rub));});
@@ -1642,7 +1654,26 @@ fn radar_sort_name(s:RadarSort)->&'static str{match s{RadarSort::Opportunity=>"�
 fn sort_deals(a:&ProductDeal,b:&ProductDeal,s:SortMode)->std::cmp::Ordering{match s{SortMode::RealPrice=>a.real_tariff_price_rub.partial_cmp(&b.real_tariff_price_rub).unwrap_or(std::cmp::Ordering::Equal),SortMode::StorePrice=>a.storefront_price_rub.partial_cmp(&b.storefront_price_rub).unwrap_or(std::cmp::Ordering::Equal),SortMode::Reviews=>b.positive_reviews.cmp(&a.positive_reviews),SortMode::Smart=>b.smart_score.partial_cmp(&a.smart_score).unwrap_or(std::cmp::Ordering::Equal)}}
 fn opt(x:Option<u64>)->String{x.map(|v|v.to_string()).unwrap_or_else(||"—".into())}
 
-fn theme(ctx:&egui::Context){let mut s=(*ctx.style()).clone();s.visuals=egui::Visuals::dark();s.visuals.panel_fill=Color32::from_rgb(10,15,28);s.visuals.window_fill=Color32::from_rgb(20,29,47);s.visuals.extreme_bg_color=Color32::from_rgb(13,20,35);s.visuals.widgets.inactive.bg_fill=Color32::from_rgb(30,41,59);s.visuals.widgets.hovered.bg_fill=Color32::from_rgb(41,61,82);s.visuals.selection.bg_fill=Color32::from_rgb(3,105,161);s.spacing.item_spacing=Vec2::new(9.0,8.0);ctx.set_style(s);}
+fn paint_sidebar_icon(painter:&egui::Painter,center:egui::Pos2,page:Page,color:Color32){
+    let stroke=Stroke::new(1.8_f32,color);
+    let p=|x:f32,y:f32|center+Vec2::new(x,y);
+    match page{
+        Page::Deals=>{painter.circle_stroke(p(-2.0,-2.0),5.5,stroke);painter.line_segment([p(2.0,2.0),p(7.0,7.0)],stroke);}
+        Page::Seller=>{painter.circle_stroke(p(0.0,-4.0),3.2,stroke);painter.add(egui::Shape::line(vec![p(-7.0,7.0),p(-6.0,4.0),p(-3.0,2.0),p(0.0,1.0),p(3.0,2.0),p(6.0,4.0),p(7.0,7.0)],stroke));}
+        Page::Sellers=>{for y in [-5.0,0.0,5.0]{painter.circle_filled(p(-6.0,y),1.3,color);painter.line_segment([p(-2.0,y),p(7.0,y)],stroke);}}
+        Page::Radar=>{painter.circle_stroke(center,8.0,stroke);painter.circle_stroke(center,4.0,Stroke::new(1.0_f32,color));painter.line_segment([center,p(6.0,-5.0)],stroke);painter.circle_filled(center,1.5,color);}
+        Page::Watchlist=>{let points=(0..10).map(|i|{let angle=-std::f32::consts::FRAC_PI_2+i as f32*std::f32::consts::PI/5.0;let radius=if i%2==0{8.0}else{3.7};p(angle.cos()*radius,angle.sin()*radius)}).collect();painter.add(egui::Shape::convex_polygon(points,color,Stroke::NONE));}
+        Page::Activity=>{for y in [-5.0,0.0,5.0]{painter.circle_filled(p(-6.0,y),1.2,color);painter.line_segment([p(-2.0,y),p(7.0,y)],stroke);}}
+    }
+}
+
+fn theme(ctx:&egui::Context){
+    let mut fonts=egui::FontDefinitions::default();
+    fonts.font_data.insert("dejavu_sans".to_owned(),egui::FontData::from_static(include_bytes!("../assets/DejaVuSans.ttf")).into());
+    for family in [egui::FontFamily::Proportional,egui::FontFamily::Monospace]{fonts.families.entry(family).or_default().push("dejavu_sans".to_owned());}
+    ctx.set_fonts(fonts);
+    let mut s=(*ctx.style()).clone();s.visuals=egui::Visuals::dark();s.visuals.panel_fill=Color32::from_rgb(10,15,28);s.visuals.window_fill=Color32::from_rgb(20,29,47);s.visuals.extreme_bg_color=Color32::from_rgb(13,20,35);s.visuals.widgets.inactive.bg_fill=Color32::from_rgb(30,41,59);s.visuals.widgets.hovered.bg_fill=Color32::from_rgb(41,61,82);s.visuals.selection.bg_fill=Color32::from_rgb(3,105,161);s.spacing.item_spacing=Vec2::new(9.0,8.0);ctx.set_style(s);
+}
 fn card(ui:&mut egui::Ui,f:impl FnOnce(&mut egui::Ui)){
     let content_width=(ui.available_width()-26.0).max(0.0);
     egui::Frame::new().fill(Color32::from_rgb(20,29,47)).stroke(Stroke::new(1.0_f32,Color32::from_rgb(37,51,72))).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(13)).show(ui,|inner|{if content_width.is_finite(){inner.set_min_width(content_width);}f(inner);});
