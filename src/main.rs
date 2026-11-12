@@ -1025,25 +1025,36 @@ fn parse_seller_html(
     })
 }
 
-async fn fetch_seller_profile(
+async fn fetch_seller_profile_with_attempts(
     client: &Client,
     url: &str,
     fallback_id: Option<u64>,
-) -> Result<SellerRecord> {
+) -> (Result<SellerRecord>, usize) {
     let mut last_err = None;
+    let mut attempts = 0usize;
     for attempt in 0..3u64 {
+        attempts = (attempt + 1) as usize;
         match client.get(url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.as_u16() == 429 || status.is_server_error() {
                     last_err = Some(anyhow::anyhow!("HTTP {} для {}", status, url));
                 } else {
-                    let resp = resp.error_for_status()?;
+                    let resp = match resp.error_for_status() {
+                        Ok(resp) => resp,
+                        Err(error) => return (Err(error.into()), attempts),
+                    };
                     let final_url = resp.url().to_string();
-                    let body = resp.text().await?;
-                    return parse_seller_html(fallback_id, final_url, &body).with_context(|| {
-                        format!("Не удалось извлечь карточку продавца со страницы {}", url)
-                    });
+                    let body = match resp.text().await {
+                        Ok(body) => body,
+                        Err(error) => return (Err(error.into()), attempts),
+                    };
+                    return (
+                        parse_seller_html(fallback_id, final_url, &body).with_context(|| {
+                            format!("Не удалось извлечь карточку продавца со страницы {}", url)
+                        }),
+                        attempts,
+                    );
                 }
             }
             Err(e) => {
@@ -1052,7 +1063,18 @@ async fn fetch_seller_profile(
         }
         tokio::time::sleep(Duration::from_millis(800 * (attempt + 1))).await;
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Неизвестная ошибка при запросе {}", url)))
+    (
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Неизвестная ошибка при запросе {}", url))),
+        attempts,
+    )
+}
+
+async fn fetch_seller_profile(
+    client: &Client,
+    url: &str,
+    fallback_id: Option<u64>,
+) -> Result<SellerRecord> {
+    fetch_seller_profile_with_attempts(client, url, fallback_id).await.0
 }
 
 async fn fetch_category_queries(client: &Client, limit: usize) -> Result<Vec<String>> {
@@ -1517,10 +1539,7 @@ async fn discover_sellers_via_api(
 
             match client.get(api_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    let parsed: SearchApiResponse = resp.json().await.unwrap_or(SearchApiResponse {
-                        total_pages: 0,
-                        items: None,
-                    });
+                    let parsed: SearchApiResponse = resp.json().await?;
                     let items = parsed.items.unwrap_or_default();
                     let batch_len = items.len();
                     for item in items {
@@ -1544,7 +1563,8 @@ async fn discover_sellers_via_api(
                         break;
                     }
                 }
-                _ => break,
+                Ok(resp) => return Err(anyhow::anyhow!("HTTP {} при поиске продавцов по запросу {}", resp.status(), query)),
+                Err(error) => return Err(error.into()),
             }
 
             page += 1;
