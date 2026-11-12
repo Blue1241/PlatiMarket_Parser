@@ -66,7 +66,7 @@ fn resizable_header_cell(ui:&mut egui::Ui,index:usize,widths:&mut [f32],total_wi
         if has_handle{
             let (rect,response)=ui.allocate_exact_size(Vec2::new(handle_width,28.0),egui::Sense::drag());
             let color=if response.hovered()||response.dragged(){Color32::from_rgb(56,189,248)}else{Color32::from_rgb(71,85,105)};
-            ui.painter().line_segment([egui::pos2(rect.center().x,rect.top()+6.0),egui::pos2(rect.center().x,rect.bottom()-6.0)],Stroke::new(if response.hovered()||response.dragged(){2.0}else{1.0},color));
+            ui.painter().line_segment([egui::pos2(rect.center().x,rect.top()+6.0),egui::pos2(rect.center().x,rect.bottom()-6.0)],Stroke::new(if response.hovered()||response.dragged(){2.0_f32}else{1.0_f32},color));
             if response.hovered()||response.dragged(){ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);}
             response.clone().on_hover_text("Перетащите разделитель, чтобы изменить ширину столбца");
             if response.dragged(){
@@ -1323,7 +1323,7 @@ impl PlatiApp {
                     let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
                     if compact_rows {
                         ui.allocate_ui_with_layout(egui::vec2(table_width,row_height-4.0),egui::Layout::top_down(egui::Align::LEFT),|row_ui|{
-                            row_ui.horizontal(|row_ui|{if row_ui.add_sized([widths[0],24.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}row_ui.add_sized([widths[1],24.0],egui::Label::new(egui::RichText::new(&product.title).wrap()));});
+                            row_ui.horizontal(|row_ui|{if row_ui.add_sized([widths[0],24.0],egui::Button::new(if yes{"★"}else{"☆"})).clicked(){toggle_favorite=Some(product.item_id);}row_ui.add_sized([widths[1],24.0],egui::Label::new(egui::RichText::new(&product.title)).wrap());});
                             row_ui.horizontal_wrapped(|row_ui|{row_ui.add_sized([widths[2],22.0],egui::Label::new(format!("Δ {}",m.delta_sales.map(|d|format!("{d:+}")).unwrap_or_else(||"—".into()))));row_ui.add_sized([widths[3],22.0],egui::Label::new(format!("{:.0} ₽",product.price_rub)));row_ui.add_sized([widths[4],22.0],egui::Label::new(format!("{} / {}",m.sellers_count,m.listings_count)));row_ui.add_sized([widths[5],22.0],egui::Label::new(m.markup_percent.map(|x|format!("{x:+.1}%")).unwrap_or_else(||"—".into())));row_ui.add_sized([widths[6],22.0],egui::Label::new(format!("{:.1}",m.opportunity_score)));});
                         });
                     } else {
