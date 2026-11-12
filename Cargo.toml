@@ -2,12 +2,11 @@
 name = "plati_rust_parser"
 version = "0.2.0"
 edition = "2021"
-description = "Нативное приложение и парсер Plati.Market на Rust"
+description = "Веб-интерфейс и парсер выгодных карточек и продавцов Plati.Market на Rust"
 
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 clap = { version = "4.5", features = ["derive"] }
 csv = "1.3"
 futures = "0.3"
