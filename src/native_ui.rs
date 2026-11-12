@@ -279,7 +279,7 @@ impl PlatiApp {
         let progress = read_niche_progress(&out_dir);
         let watchlist = read_json_or(out_dir.join("watchlist.json"), Vec::new());
         let watched_sellers = read_json_or(out_dir.join("watched_sellers.json"), Vec::new());
-        let app = Self {
+        let mut app = Self {
             settings: settings.clone(), settings_saved: settings.clone(), out_dir, output_shared, client, runtime, tx, rx,
             page: settings.page, message: String::new(),
             query: settings.query.clone(), keyword: settings.keyword.clone(), exclude: settings.exclude.clone(),
