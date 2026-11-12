@@ -95,6 +95,10 @@ enum Commands {
         url: String,
     },
 
+    #[cfg(feature = "desktop")]
+    /// Запустить приложение в отдельном нативном окне
+    Desktop,
+
     /// Собрать базу активных продавцов через cats.xml + Public API (CLI)
     Discover {
         #[arg(long, default_value_t = 20)]
@@ -1892,7 +1896,7 @@ async fn api_discover_sellers_handler(
     (StatusCode::OK, Json(json!({ "sellers": sellers })))
 }
 
-async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
+async fn prepare_web_app(client: Client, out_dir: PathBuf) -> Result<Router> {
     if !niche_checkpoint_path(&out_dir).exists() {
         let mut progress = read_niche_progress(&out_dir);
         if progress.status == "starting" || progress.status == "collecting" {
@@ -1940,11 +1944,15 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
         .route("/api/seller", get(api_seller_handler))
         .route("/api/discover-sellers", post(api_discover_sellers_handler))
         .with_state(state);
+    Ok(app)
+}
 
+async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("Не удалось занять порт {}", port))?;
+    let app = prepare_web_app(client, out_dir).await?;
 
     println!("======================================================");
     println!(" Plati Radar запущен!");
@@ -1955,17 +1963,62 @@ async fn run_web_server(client: Client, out_dir: PathBuf, port: u16) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "desktop")]
+fn run_desktop(out_dir: PathBuf) -> Result<()> {
+    use std::sync::mpsc;
+    use tauri::WebviewUrl;
+
+    let (url_tx, url_rx) = mpsc::sync_channel::<String>(1);
+    std::thread::Builder::new()
+        .name("plati-radar-server".into())
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let client = build_client()?;
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+                let address = listener.local_addr()?;
+                let app = prepare_web_app(client, out_dir).await?;
+                url_tx.send(format!("http://{address}/"))
+                    .map_err(|_| anyhow::anyhow!("Окно приложения не запустилось"))?;
+                axum::serve(listener, app).await?;
+                Ok(())
+            })
+        })
+        .context("Не удалось запустить локальный сервер")?;
+
+    tauri::Builder::default()
+        .setup(move |app| {
+            let url = url_rx.recv_timeout(Duration::from_secs(30))?;
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::External(url.parse()?),
+            )
+            .title("Plati Radar")
+            .inner_size(1440.0, 960.0)
+            .min_inner_size(900.0, 620.0)
+            .build()?;
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .context("Не удалось запустить нативное окно")?;
+    Ok(())
+}
+
 // ======================= MAIN =======================
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn execute_cli(cli: Cli) -> Result<()> {
     let client = build_client()?;
 
     match cli.command.unwrap_or(Commands::Serve { port: 8080 }) {
         Commands::Serve { port } => {
             run_web_server(client, cli.out_dir, port).await?;
         }
+
+        #[cfg(feature = "desktop")]
+        Commands::Desktop => anyhow::bail!("desktop должен запускаться из главной точки входа"),
 
         Commands::Deals {
             query,
@@ -2072,4 +2125,23 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(feature = "desktop"))]
+#[tokio::main]
+async fn main() -> Result<()> {
+    execute_cli(Cli::parse()).await
+}
+
+#[cfg(feature = "desktop")]
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if matches!(&cli.command, None | Some(Commands::Desktop)) {
+        return run_desktop(cli.out_dir);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(execute_cli(cli))
 }
