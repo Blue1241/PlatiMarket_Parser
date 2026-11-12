@@ -1167,7 +1167,7 @@ impl PlatiApp {
             // Keep a practical minimum width so columns remain usable in small windows;
             // the shared horizontal scroll then moves header and rows together.
             let column_budget=(table_width-5.0*8.0).max(1100.0);
-            egui::ScrollArea::both().auto_shrink([false,false]).min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
+            egui::ScrollArea::both().id_salt("deals_table_scroll").auto_shrink([false,false]).min_scrolled_height(results_height).max_height(results_height).show(ui,|ui|{
                 egui::Grid::new("deal_rows").striped(true).spacing([8.0,6.0]).min_col_width(1.0).show(ui,|ui|{
                     resizable_header_cell(ui,0,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Карточка").strong().color(Color32::from_rgb(125,211,252))));});
                     resizable_header_cell(ui,1,&mut self.deal_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Тариф").strong().color(Color32::from_rgb(125,211,252))));});
@@ -1271,7 +1271,7 @@ impl PlatiApp {
             let table_width=ui.available_width();
             let column_budget=(table_width-5.0*8.0).max(860.0);
             let seller_list_height=(ui.available_height()-150.0).clamp(180.0,720.0);
-            egui::ScrollArea::both().auto_shrink([false,false]).max_height(seller_list_height).show(ui,|ui|{
+            egui::ScrollArea::both().id_salt("sellers_table_scroll").auto_shrink([false,false]).max_height(seller_list_height).show(ui,|ui|{
                 egui::Grid::new("seller_list").striped(true).spacing([8.0,6.0]).min_col_width(1.0).show(ui,|ui|{
                     resizable_header_cell(ui,0,&mut self.seller_column_widths,column_budget,|ui,width|{ui.add_sized([width,30.0],egui::Label::new(RichText::new("Продавец").strong().color(Color32::from_rgb(125,211,252))));});
                     for (index,(title,sort)) in [("Рейтинг",SellerSort::Rating),("Продажи",SellerSort::Sales),("Отзывы",SellerSort::Reviews)].into_iter().enumerate(){
@@ -1344,10 +1344,9 @@ impl PlatiApp {
             let labels=["★","Карточка / категория","Δ продаж","Цена","Продавцы","Наценка","Балл"];
             let mut toggle_favorite=None;
             let row_height=68.0;
-            let table_height=(ui.available_height()-36.0).clamp(120.0,900.0);
-            // One horizontal viewport wraps both header and body; vertical scrolling is
-            // confined to the rows so column edges stay aligned while scrolling sideways.
-            egui::ScrollArea::horizontal().auto_shrink([false,false]).show(ui,|ui|{
+            let table_height=(viewport_height*0.42).clamp(260.0,520.0);
+            // A dedicated horizontal viewport keeps this table's header and rows in sync.
+            egui::ScrollArea::horizontal().id_salt("radar_table_horizontal").auto_shrink([false,false]).show(ui,|ui|{
                 ui.horizontal(|ui|{
                     ui.spacing_mut().item_spacing.x=9.0;
                     for (index,label) in labels.into_iter().enumerate(){
@@ -1357,7 +1356,7 @@ impl PlatiApp {
                 let widths=self.radar_column_widths.map(|ratio|ratio*column_budget);
                 let content_width=widths.iter().sum::<f32>()+6.0*9.0;
                 ui.set_min_width(content_width);
-                egui::ScrollArea::vertical().auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
+                egui::ScrollArea::vertical().id_salt("radar_table_rows").auto_shrink([false,false]).max_height(table_height).show_rows(ui,row_height,self.radar_visible.len(),|ui,range|{
                     ui.set_min_width(content_width);
                     for row in range {
                         let metric_index=self.radar_visible[row];let m=self.radar_metrics[metric_index];
@@ -1513,9 +1512,9 @@ impl eframe::App for PlatiApp {
         egui::CentralPanel::default().frame(egui::Frame::central_panel(&ctx.style()).fill(Color32::from_rgb(10,15,28)).inner_margin(egui::Margin::symmetric(horizontal_margin,vertical_margin))).show(ctx,|ui|{
             self.header(ui);
             if self.page==Page::Radar {
-                // Keep the radar table as the only vertical scrolling region on this page.
-                // A parent ScrollArea makes egui chain wheel input into both areas.
-                self.radar_view(ui);
+                // The page has its own vertical scroll; the radar table keeps a distinct
+                // virtualized row scroller and a linked horizontal header/body viewport.
+                egui::ScrollArea::vertical().id_salt("radar_page_scroll").auto_shrink([false,false]).show(ui,|ui|self.radar_view(ui));
             } else {
                 egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|match self.page{Page::Deals=>self.deals_view(ui),Page::Seller=>self.seller_view(ui),Page::Sellers=>self.discover_view(ui),Page::Radar=>{},Page::Watchlist=>self.watchlist_view(ui),Page::Activity=>self.activity_view(ui)});
             }
